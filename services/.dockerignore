@@ -1,0 +1,41 @@
+# =============================================================================
+# Docker Build Context Ignore
+# =============================================================================
+# Placed in services/ because docker-compose.yml sets `context: ./services`
+# Reduces build context size and prevents leaking dev artifacts into images.
+
+# Python bytecode & caches
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+
+# Test artifacts
+**/htmlcov/
+**/.coverage
+**/coverage.xml
+
+# Virtual environments
+**/.venv/
+**/venv/
+**/env/
+
+# IDE files
+**/.vscode/
+**/.idea/
+**/*.swp
+**/*.swo
+
+# Git
+**/.git/
+**/.gitignore
+
+# OS files
+**/.DS_Store
+**/Thumbs.db
+
+# Documentation
+**/README.md
+**/docs/CLAUDE.md
+**/docs/AGENTS.md

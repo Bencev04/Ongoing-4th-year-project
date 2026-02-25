@@ -1,0 +1,1133 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6"
+     x-data="adminApp()"
+     x-init="init()">
+
+    <!-- ============================================================ -->
+    <!-- Access Denied (non-superadmin) -->
+    <!-- ============================================================ -->
+    <div x-show="accessDenied" x-cloak
+         class="text-center py-20">
+        <svg class="mx-auto h-16 w-16 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728L5.636 5.636" />
+        </svg>
+        <h2 class="mt-4 text-xl font-semibold text-gray-900">Access Denied</h2>
+        <p class="mt-2 text-gray-500">This page is restricted to platform administrators.</p>
+        <a href="/calendar"
+           class="mt-6 inline-flex items-center px-4 py-2 bg-teal-500 text-white text-sm font-medium rounded-md hover:bg-teal-600 transition-colors">
+            Return to Calendar
+        </a>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- Admin Dashboard -->
+    <!-- ============================================================ -->
+    <div x-show="!accessDenied" x-cloak>
+
+        <!-- Page Header -->
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <h1 class="text-2xl font-bold text-gray-900">Admin Portal</h1>
+                <p class="mt-1 text-sm text-gray-500">Platform administration and monitoring</p>
+            </div>
+            <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                <svg class="mr-1.5 h-3 w-3" fill="currentColor" viewBox="0 0 8 8">
+                    <circle cx="4" cy="4" r="3"/>
+                </svg>
+                Superadmin
+            </span>
+        </div>
+
+        <!-- Tab Navigation -->
+        <div class="border-b border-gray-200 mb-6">
+            <nav class="-mb-px flex space-x-8">
+                <button @click="activeTab = 'organizations'; loadOrganizations()"
+                        :class="activeTab === 'organizations' ? 'border-teal-500 text-teal-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                        class="whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm transition-colors">
+                    Organizations
+                </button>
+                <button @click="activeTab = 'users'; loadUsers()"
+                        :class="activeTab === 'users' ? 'border-teal-500 text-teal-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                        class="whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm transition-colors">
+                    Users
+                </button>
+                <button @click="activeTab = 'audit'; loadAuditLogs()"
+                        :class="activeTab === 'audit' ? 'border-teal-500 text-teal-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                        class="whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm transition-colors">
+                    Audit Logs
+                </button>
+                <button @click="activeTab = 'settings'; loadSettings()"
+                        :class="activeTab === 'settings' ? 'border-teal-500 text-teal-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                        class="whitespace-nowrap py-3 px-1 border-b-2 font-medium text-sm transition-colors">
+                    Settings
+                </button>
+            </nav>
+        </div>
+
+        <!-- Loading indicator -->
+        <div x-show="loading" class="text-center py-12">
+            <svg class="animate-spin h-8 w-8 text-teal-500 mx-auto" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p class="mt-2 text-sm text-gray-500">Loading…</p>
+        </div>
+
+        <!-- Error message -->
+        <div x-show="error" x-cloak
+             class="rounded-md bg-red-50 p-4 mb-6">
+            <div class="flex">
+                <svg class="h-5 w-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <p class="ml-3 text-sm text-red-700" x-text="error"></p>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Organizations Tab -->
+        <!-- ============================================================ -->
+        <div x-show="activeTab === 'organizations' && !loading">
+            <!-- Toolbar -->
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-lg font-semibold text-gray-900">Organizations</h2>
+                <button @click="openCreateOrgModal()"
+                        class="inline-flex items-center px-4 py-2 bg-teal-500 text-white text-sm font-medium rounded-md hover:bg-teal-600 transition-colors">
+                    <svg class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                    </svg>
+                    New Organization
+                </button>
+            </div>
+
+            <!-- Organizations Table -->
+            <div class="bg-white shadow overflow-hidden rounded-lg">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Slug</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Plan</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Limits</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                        <template x-for="org in organizations" :key="org.id">
+                            <tr class="hover:bg-gray-50 transition-colors">
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="text-sm font-medium text-gray-900" x-text="org.name"></div>
+                                    <div class="text-xs text-gray-500" x-text="org.billing_email || '—'"></div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <code class="text-sm text-gray-600 bg-gray-100 px-2 py-0.5 rounded" x-text="org.slug"></code>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium capitalize"
+                                          :class="{
+                                              'bg-gray-100 text-gray-800': org.billing_plan === 'free',
+                                              'bg-blue-100 text-blue-800': org.billing_plan === 'starter',
+                                              'bg-teal-100 text-teal-800': org.billing_plan === 'professional',
+                                              'bg-purple-100 text-purple-800': org.billing_plan === 'enterprise'
+                                          }"
+                                          x-text="org.billing_plan"></span>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium"
+                                          :class="org.is_active ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'">
+                                        <svg class="mr-1.5 h-2 w-2" :class="org.is_active ? 'text-green-400' : 'text-red-400'" fill="currentColor" viewBox="0 0 8 8">
+                                            <circle cx="4" cy="4" r="3"/>
+                                        </svg>
+                                        <span x-text="org.is_active ? 'Active' : 'Suspended'"></span>
+                                    </span>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                    <span x-text="org.max_users + ' users / ' + org.max_customers + ' customers'"></span>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                    <button x-show="org.is_active"
+                                            @click="suspendOrg(org.id)"
+                                            class="text-red-600 hover:text-red-900 mr-3 transition-colors">
+                                        Suspend
+                                    </button>
+                                    <button x-show="!org.is_active"
+                                            @click="unsuspendOrg(org.id)"
+                                            class="text-green-600 hover:text-green-900 mr-3 transition-colors">
+                                        Reactivate
+                                    </button>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Empty State -->
+            <div x-show="!loading && organizations.length === 0" x-cloak
+                 class="text-center py-12 bg-white rounded-lg shadow">
+                <svg class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
+                </svg>
+                <h3 class="mt-2 text-sm font-medium text-gray-900">No organizations</h3>
+                <p class="mt-1 text-sm text-gray-500">Get started by creating a new organization.</p>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Users Tab -->
+        <!-- ============================================================ -->
+        <div x-show="activeTab === 'users' && !loading">
+            <h2 class="text-lg font-semibold text-gray-900 mb-4">All Users (Cross-Tenant)</h2>
+
+            <div class="bg-white shadow overflow-hidden rounded-lg">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Org ID</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Joined</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                        <template x-for="user in users" :key="user.id">
+                            <tr class="hover:bg-gray-50 transition-colors">
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="flex items-center">
+                                        <div class="h-8 w-8 rounded-full bg-gradient-to-br from-teal-400 to-teal-600 flex items-center justify-center">
+                                            <span class="text-xs font-semibold text-white" x-text="(user.first_name?.[0] || '') + (user.last_name?.[0] || '')"></span>
+                                        </div>
+                                        <div class="ml-3">
+                                            <div class="text-sm font-medium text-gray-900" x-text="user.first_name + ' ' + user.last_name"></div>
+                                            <div class="text-xs text-gray-500" x-text="user.email"></div>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium capitalize"
+                                          :class="{
+                                              'bg-purple-100 text-purple-800': user.role === 'superadmin',
+                                              'bg-teal-100 text-teal-800': user.role === 'owner',
+                                              'bg-blue-100 text-blue-800': user.role === 'admin',
+                                              'bg-yellow-100 text-yellow-800': user.role === 'manager',
+                                              'bg-gray-100 text-gray-800': user.role === 'employee' || user.role === 'viewer'
+                                          }"
+                                          x-text="user.role"></span>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium"
+                                          :class="user.is_active ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'"
+                                          x-text="user.is_active ? 'Active' : 'Inactive'"></span>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="user.organization_id || '—'"></td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="new Date(user.created_at).toLocaleDateString()"></td>
+                                <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                    <div class="flex items-center justify-end space-x-2">
+                                        <button @click="openResetPasswordModal(user)"
+                                                class="text-teal-600 hover:text-teal-900 transition-colors"
+                                                title="Reset password">
+                                            <svg class="h-5 w-5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                      d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                                            </svg>
+                                        </button>
+                                        <button @click="impersonateUser(user.id)"
+                                                x-show="user.role !== 'superadmin'"
+                                                class="text-purple-600 hover:text-purple-900 transition-colors"
+                                                title="Impersonate this user">
+                                            <svg class="h-5 w-5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                      d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                      d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+
+            <div x-show="!loading && users.length === 0" x-cloak
+                 class="text-center py-12 bg-white rounded-lg shadow">
+                <p class="text-sm text-gray-500">No users found.</p>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Audit Logs Tab -->
+        <!-- ============================================================ -->
+        <div x-show="activeTab === 'audit' && !loading">
+            <h2 class="text-lg font-semibold text-gray-900 mb-4">Audit Trail</h2>
+
+            <!-- Search & Filter Bar -->
+            <div class="mb-4 flex flex-col sm:flex-row gap-3">
+                <div class="relative flex-1">
+                    <svg class="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                    </svg>
+                    <input type="text" x-model="auditSearch" placeholder="Search logs (email, action, resource, details…)"
+                           class="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:ring-teal-500 focus:border-teal-500" />
+                </div>
+                <select x-model="auditActionFilter" class="border border-gray-300 rounded-lg text-sm px-3 py-2 focus:ring-teal-500 focus:border-teal-500">
+                    <option value="">All Actions</option>
+                    <template x-for="a in auditActionOptions" :key="a">
+                        <option :value="a" x-text="a"></option>
+                    </template>
+                </select>
+                <select x-model="auditResourceFilter" class="border border-gray-300 rounded-lg text-sm px-3 py-2 focus:ring-teal-500 focus:border-teal-500">
+                    <option value="">All Resources</option>
+                    <template x-for="r in auditResourceOptions" :key="r">
+                        <option :value="r" x-text="r"></option>
+                    </template>
+                </select>
+            </div>
+
+            <!-- Results count -->
+            <p class="text-xs text-gray-500 mb-2"
+               x-show="auditSearch || auditActionFilter || auditResourceFilter"
+               x-text="'Showing ' + filteredAuditLogs.length + ' of ' + auditLogs.length + ' entries'"></p>
+
+            <div class="bg-white shadow overflow-hidden rounded-lg">
+                <!-- Header row -->
+                <div class="bg-gray-50 border-b border-gray-200 hidden sm:grid grid-cols-12 gap-2 px-6 py-3">
+                    <div class="col-span-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Timestamp</div>
+                    <div class="col-span-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Actor</div>
+                    <div class="col-span-2 text-xs font-medium text-gray-500 uppercase tracking-wider">Action</div>
+                    <div class="col-span-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Resource</div>
+                    <div class="col-span-1"></div>
+                </div>
+
+                <!-- Log entries -->
+                <template x-for="log in filteredAuditLogs" :key="log.id">
+                    <div class="border-b border-gray-200 last:border-b-0">
+                        <!-- Summary row (clickable) -->
+                        <div class="grid grid-cols-1 sm:grid-cols-12 gap-2 px-6 py-4 cursor-pointer hover:bg-gray-50 transition-colors items-center"
+                             @click="expandedLogId = expandedLogId === log.id ? null : log.id">
+                            <div class="sm:col-span-3 text-sm text-gray-500">
+                                <span class="sm:hidden text-xs font-medium text-gray-400 mr-1">Time:</span>
+                                <span x-text="new Date(log.timestamp).toLocaleString()"></span>
+                            </div>
+                            <div class="sm:col-span-3">
+                                <div class="text-sm text-gray-900" x-text="log.actor_email || 'System'"></div>
+                                <div class="text-xs text-gray-500" x-text="log.actor_role"></div>
+                                <div x-show="log.impersonator_id" class="text-xs text-purple-600">
+                                    (impersonated by #<span x-text="log.impersonator_id"></span>)
+                                </div>
+                            </div>
+                            <div class="sm:col-span-2">
+                                <code class="text-sm bg-gray-100 px-2 py-0.5 rounded" x-text="log.action"></code>
+                            </div>
+                            <div class="sm:col-span-3 text-sm text-gray-500">
+                                <span x-text="(log.resource_type || '') + (log.resource_id ? ' #' + log.resource_id : '')"></span>
+                            </div>
+                            <div class="sm:col-span-1 text-right">
+                                <svg class="h-5 w-5 text-gray-400 transition-transform duration-200 inline-block"
+                                     :class="expandedLogId === log.id ? 'rotate-180' : ''"
+                                     fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                                </svg>
+                            </div>
+                        </div>
+
+                        <!-- Expanded detail panel (inline, right below its row) -->
+                        <div x-show="expandedLogId === log.id" x-collapse x-cloak
+                             class="bg-gray-50 px-6 py-4 border-t border-gray-100">
+                            <h4 class="text-xs font-semibold text-gray-700 uppercase mb-2">Full Details</h4>
+                            <template x-if="log.details && typeof log.details === 'object'">
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1">
+                                    <template x-for="key in Object.keys(log.details)" :key="key">
+                                        <div class="flex gap-2 py-1">
+                                            <span class="text-xs font-medium text-gray-600 min-w-[100px]" x-text="key + ':'"></span>
+                                            <span class="text-xs text-gray-800 break-all" x-text="typeof log.details[key] === 'object' ? JSON.stringify(log.details[key], null, 2) : String(log.details[key])"></span>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                            <template x-if="log.details && typeof log.details !== 'object'">
+                                <pre class="text-xs text-gray-800 whitespace-pre-wrap break-all" x-text="String(log.details)"></pre>
+                            </template>
+                            <template x-if="!log.details">
+                                <p class="text-xs text-gray-400 italic">No additional details recorded.</p>
+                            </template>
+                            <div class="mt-3 pt-2 border-t border-gray-200 text-xs text-gray-400">
+                                Log ID: <span x-text="log.id"></span>
+                                <template x-if="log.organization_id">
+                                    <span> &middot; Org #<span x-text="log.organization_id"></span></span>
+                                </template>
+                                <template x-if="log.ip_address">
+                                    <span> &middot; IP: <span x-text="log.ip_address"></span></span>
+                                </template>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <div x-show="!loading && filteredAuditLogs.length === 0" x-cloak
+                 class="text-center py-12 bg-white rounded-lg shadow">
+                <p class="text-sm text-gray-500" x-text="auditSearch || auditActionFilter || auditResourceFilter ? 'No audit logs match your search.' : 'No audit log entries found.'"></p>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Settings Tab -->
+        <!-- ============================================================ -->
+        <div x-show="activeTab === 'settings' && !loading">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-lg font-semibold text-gray-900">Platform Settings</h2>
+                <p class="text-xs text-gray-500">Changes take effect immediately for all organizations</p>
+            </div>
+
+            <div class="space-y-4">
+                <!-- Maintenance Mode (Toggle) -->
+                <div class="bg-white shadow rounded-lg px-6 py-5">
+                    <div class="flex items-center justify-between">
+                        <div class="flex-1">
+                            <h3 class="text-sm font-semibold text-gray-900">Maintenance Mode</h3>
+                            <p class="mt-1 text-xs text-gray-500" x-text="getSettingDescription('maintenance_mode')"></p>
+                            <p class="mt-1 text-xs text-gray-400" x-show="getSettingUpdatedBy('maintenance_mode')"
+                               x-text="'Last updated by user #' + getSettingUpdatedBy('maintenance_mode')"></p>
+                        </div>
+                        <div class="flex items-center space-x-3">
+                            <span class="text-sm font-medium text-gray-700" 
+                                  :class="getSettingValue('maintenance_mode', 'enabled') ? 'text-red-600' : 'text-green-600'"
+                                  x-text="getSettingValue('maintenance_mode', 'enabled') ? 'Platform Locked' : 'Operational'"></span>
+                            <button @click="toggleMaintenanceMode()" type="button" role="switch"
+                                    :aria-checked="getSettingValue('maintenance_mode', 'enabled')"
+                                    :class="getSettingValue('maintenance_mode', 'enabled') ? 'bg-red-600' : 'bg-gray-200'"
+                                    class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2">
+                                <span aria-hidden="true"
+                                      :class="getSettingValue('maintenance_mode', 'enabled') ? 'translate-x-5' : 'translate-x-0'"
+                                      class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out"></span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Max Login Attempts (Number) -->
+                <div class="bg-white shadow rounded-lg px-6 py-5">
+                    <div class="flex items-center justify-between">
+                        <div class="flex-1">
+                            <h3 class="text-sm font-semibold text-gray-900">Max Login Attempts</h3>
+                            <p class="mt-1 text-xs text-gray-500" x-text="getSettingDescription('max_login_attempts')"></p>
+                        </div>
+                        <div class="flex items-center space-x-3">
+                            <input type="number" min="3" max="20" step="1"
+                                   :value="getSettingValue('max_login_attempts', 'value')"
+                                   @change="updateSetting('max_login_attempts', {value: parseInt($event.target.value)}, $event.target)"
+                                   class="w-20 rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 text-sm">
+                            <span class="text-xs text-gray-500">attempts</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Session Timeout (Number) -->
+                <div class="bg-white shadow rounded-lg px-6 py-5">
+                    <div class="flex items-center justify-between">
+                        <div class="flex-1">
+                            <h3 class="text-sm font-semibold text-gray-900">Session Timeout</h3>
+                            <p class="mt-1 text-xs text-gray-500" x-text="getSettingDescription('session_timeout_minutes')"></p>
+                        </div>
+                        <div class="flex items-center space-x-3">
+                            <input type="number" min="5" max="1440" step="5"
+                                   :value="getSettingValue('session_timeout_minutes', 'value')"
+                                   @change="updateSetting('session_timeout_minutes', {value: parseInt($event.target.value)}, $event.target)"
+                                   class="w-20 rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 text-sm">
+                            <span class="text-xs text-gray-500">minutes</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Default Billing Plan (Dropdown) -->
+                <div class="bg-white shadow rounded-lg px-6 py-5">
+                    <div class="flex items-center justify-between">
+                        <div class="flex-1">
+                            <h3 class="text-sm font-semibold text-gray-900">Default Billing Plan</h3>
+                            <p class="mt-1 text-xs text-gray-500" x-text="getSettingDescription('default_billing_plan')"></p>
+                        </div>
+                        <div class="flex items-center space-x-3">
+                            <select :value="getSettingValue('default_billing_plan', 'value')"
+                                    @change="updateSetting('default_billing_plan', {value: $event.target.value}, $event.target)"
+                                    class="rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 text-sm">
+                                <option value="free">Free</option>
+                                <option value="starter">Starter</option>
+                                <option value="professional">Professional</option>
+                                <option value="enterprise">Enterprise</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- Create Organization Modal -->
+    <!-- ============================================================ -->
+    <div x-show="showCreateOrgModal" x-cloak
+         class="fixed inset-0 z-50 overflow-y-auto"
+         @keydown.escape.window="showCreateOrgModal = false">
+        <div class="flex min-h-full items-end justify-center p-4 text-center sm:items-center sm:p-0">
+            <!-- Backdrop -->
+            <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity"
+                 @click="showCreateOrgModal = false"></div>
+
+            <!-- Modal panel -->
+            <div class="relative transform rounded-lg bg-white px-4 pb-4 pt-5 text-left shadow-xl sm:my-8 sm:w-full sm:max-w-lg sm:p-6">
+                <h3 class="text-lg font-semibold text-gray-900 mb-4">Create Organization</h3>
+
+                <form @submit.prevent="createOrganization()">
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Name</label>
+                            <input type="text" x-model="newOrg.name" required
+                                   class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Slug</label>
+                            <input type="text" x-model="newOrg.slug" required
+                                   pattern="[a-z0-9]+(-[a-z0-9]+)*"
+                                   placeholder="my-org-name"
+                                   class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                            <p class="mt-1 text-xs text-gray-500">Lowercase letters, numbers, and hyphens only.</p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Billing Email</label>
+                            <input type="email" x-model="newOrg.billing_email"
+                                   class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Plan</label>
+                            <select x-model="newOrg.billing_plan"
+                                    class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                                <option value="free">Free</option>
+                                <option value="starter">Starter</option>
+                                <option value="professional">Professional</option>
+                                <option value="enterprise">Enterprise</option>
+                            </select>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Max Users</label>
+                                <input type="number" x-model.number="newOrg.max_users" min="1"
+                                       class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Max Customers</label>
+                                <input type="number" x-model.number="newOrg.max_customers" min="1"
+                                       class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mt-6 flex justify-end space-x-3">
+                        <button type="button" @click="showCreateOrgModal = false"
+                                class="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors">
+                            Cancel
+                        </button>
+                        <button type="submit"
+                                class="px-4 py-2 bg-teal-500 text-white rounded-md text-sm font-medium hover:bg-teal-600 transition-colors">
+                            Create
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- Reset Password Modal -->
+    <!-- ============================================================ -->
+    <div x-show="showResetPasswordModal" x-cloak
+         class="fixed inset-0 z-50 overflow-y-auto"
+         @keydown.escape.window="showResetPasswordModal = false">
+        <div class="flex min-h-full items-end justify-center p-4 text-center sm:items-center sm:p-0">
+            <!-- Backdrop -->
+            <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity"
+                 @click="showResetPasswordModal = false"></div>
+
+            <!-- Modal panel -->
+            <div class="relative transform rounded-lg bg-white px-4 pb-4 pt-5 text-left shadow-xl sm:my-8 sm:w-full sm:max-w-md sm:p-6">
+                <h3 class="text-lg font-semibold text-gray-900 mb-4">Reset Password</h3>
+
+                <div class="mb-4 bg-blue-50 border-l-4 border-blue-400 p-3">
+                    <div class="flex">
+                        <div class="flex-shrink-0">
+                            <svg class="h-5 w-5 text-blue-400" viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" />
+                            </svg>
+                        </div>
+                        <div class="ml-3">
+                            <p class="text-sm text-blue-700">
+                                Resetting password for: <strong x-text="resetPasswordUser?.first_name + ' ' + resetPasswordUser?.last_name"></strong>
+                                (<span x-text="resetPasswordUser?.email"></span>)
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <form @submit.prevent="resetUserPassword()">
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">New Password *</label>
+                            <input type="password" x-model="resetPasswordForm.newPassword" required
+                                   minlength="8"
+                                   class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                            <p class="mt-1 text-xs text-gray-500">Minimum 8 characters</p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Confirm Password *</label>
+                            <input type="password" x-model="resetPasswordForm.confirmPassword" required
+                                   minlength="8"
+                                   class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                        </div>
+                    </div>
+
+                    <div class="mt-6 flex justify-end space-x-3">
+                        <button type="button" @click="showResetPasswordModal = false"
+                                class="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors">
+                            Cancel
+                        </button>
+                        <button type="submit"
+                                :disabled="submittingReset"
+                                :class="submittingReset ? 'opacity-50 cursor-not-allowed' : 'hover:bg-teal-600'"
+                                class="px-4 py-2 bg-teal-500 text-white rounded-md text-sm font-medium transition-colors">
+                            <span x-show="!submittingReset">Reset Password</span>
+                            <span x-show="submittingReset">Resetting...</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<!-- ============================================================ -->
+<!-- Admin App Script -->
+<!-- ============================================================ -->
+<script>
+/**
+ * Alpine.js application for the admin portal.
+ *
+ * Handles organization CRUD, user listing, audit log viewing,
+ * platform settings, and user impersonation.
+ *
+ * @returns {Object} Alpine.js component data
+ */
+function adminApp() {
+    return {
+        /** @type {boolean} Whether the current user lacks superadmin access */
+        accessDenied: false,
+        /** @type {string} Active tab identifier */
+        activeTab: 'organizations',
+        /** @type {boolean} Loading state */
+        loading: true,
+        /** @type {boolean} Whether a mutation is in flight (prevents double-submit) */
+        submitting: false,
+        /** @type {string|null} Error message */
+        error: null,
+
+        /** @type {Array<Object>} Organizations list */
+        organizations: [],
+        /** @type {Array<Object>} Users list (cross-tenant) */
+        users: [],
+        /** @type {Array<Object>} Audit log entries */
+        auditLogs: [],
+        /** @type {string} Search query for audit logs */
+        auditSearch: '',
+        /** @type {string} Filter by action type */
+        auditActionFilter: '',
+        /** @type {string} Filter by resource type */
+        auditResourceFilter: '',
+        /** @type {number|null} Currently expanded log entry ID */
+        expandedLogId: null,
+        /** @type {Array<Object>} Platform settings */
+        platformSettings: [],
+
+        /** @type {boolean} Create org modal visibility */
+        showCreateOrgModal: false,
+        /** @type {Object} New organization form data */
+        newOrg: {
+            name: '',
+            slug: '',
+            billing_email: '',
+            billing_plan: 'free',
+            max_users: 50,
+            max_customers: 500,
+        },
+
+        /** @type {boolean} Reset password modal visibility */
+        showResetPasswordModal: false,
+        /** @type {boolean} Submitting password reset */
+        submittingReset: false,
+        /** @type {Object|null} User whose password is being reset */
+        resetPasswordUser: null,
+        /** @type {Object} Reset password form data */
+        resetPasswordForm: {
+            newPassword: '',
+            confirmPassword: '',
+        },
+
+        /**
+         * Initialise the admin app — check role, load orgs.
+         * @returns {Promise<void>}
+         */
+        async init() {
+            // Check if user is superadmin by calling /api/auth/me
+            try {
+                const resp = await authFetch('/api/auth/me');
+                if (!resp.ok) {
+                    this.accessDenied = true;
+                    this.loading = false;
+                    return;
+                }
+                const data = await resp.json();
+                if (data.role !== 'superadmin') {
+                    this.accessDenied = true;
+                    this.loading = false;
+                    return;
+                }
+            } catch (e) {
+                this.accessDenied = true;
+                this.loading = false;
+                return;
+            }
+
+            await this.loadOrganizations();
+        },
+
+        /**
+         * Load organizations from the admin API.
+         * @returns {Promise<void>}
+         */
+        async loadOrganizations() {
+            this.loading = true;
+            this.error = null;
+            try {
+                const resp = await authFetch('/api/admin/organizations');
+                if (!resp.ok) throw new Error(`Failed to load organizations (${resp.status})`);
+                const data = await resp.json();
+                this.organizations = data.items || [];
+            } catch (err) {
+                this.error = err.message || 'Failed to load organizations';
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        /**
+         * Load users from the admin API.
+         * @returns {Promise<void>}
+         */
+        async loadUsers() {
+            this.loading = true;
+            this.error = null;
+            try {
+                const resp = await authFetch('/api/admin/users');
+                if (!resp.ok) throw new Error(`Failed to load users (${resp.status})`);
+                const data = await resp.json();
+                this.users = data.items || [];
+            } catch (err) {
+                this.error = err.message || 'Failed to load users';
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        /**
+         * Load audit logs from the admin API.
+         * @returns {Promise<void>}
+         */
+        async loadAuditLogs() {
+            this.loading = true;
+            this.error = null;
+            this.expandedLogId = null;
+            try {
+                const resp = await authFetch('/api/admin/audit-logs?per_page=100');
+                if (!resp.ok) throw new Error(`Failed to load audit logs (${resp.status})`);
+                const data = await resp.json();
+                this.auditLogs = data.items || [];
+            } catch (err) {
+                this.error = err.message || 'Failed to load audit logs';
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        /**
+         * Unique action values from loaded audit logs for the filter dropdown.
+         * @returns {Array<string>}
+         */
+        get auditActionOptions() {
+            return [...new Set(this.auditLogs.map(l => l.action).filter(Boolean))].sort();
+        },
+
+        /**
+         * Unique resource_type values from loaded audit logs for the filter dropdown.
+         * @returns {Array<string>}
+         */
+        get auditResourceOptions() {
+            return [...new Set(this.auditLogs.map(l => l.resource_type).filter(Boolean))].sort();
+        },
+
+        /**
+         * Audit logs filtered by search text and dropdown filters.
+         * Searches across actor_email, action, resource_type, resource_id, and details.
+         * @returns {Array<Object>}
+         */
+        get filteredAuditLogs() {
+            let logs = this.auditLogs;
+
+            if (this.auditActionFilter) {
+                logs = logs.filter(l => l.action === this.auditActionFilter);
+            }
+            if (this.auditResourceFilter) {
+                logs = logs.filter(l => l.resource_type === this.auditResourceFilter);
+            }
+            if (this.auditSearch) {
+                const q = this.auditSearch.toLowerCase();
+                logs = logs.filter(l => {
+                    const haystack = [
+                        l.actor_email || '',
+                        l.actor_role || '',
+                        l.action || '',
+                        l.resource_type || '',
+                        l.resource_id ? String(l.resource_id) : '',
+                        l.details ? JSON.stringify(l.details) : '',
+                        l.ip_address || '',
+                    ].join(' ').toLowerCase();
+                    return haystack.includes(q);
+                });
+            }
+
+            return logs;
+        },
+
+        /**
+         * Load platform settings from the admin API.
+         * @returns {Promise<void>}
+         */
+        async loadSettings() {
+            this.loading = true;
+            this.error = null;
+            try {
+                const resp = await authFetch('/api/admin/settings');
+                if (!resp.ok) throw new Error(`Failed to load settings (${resp.status})`);
+                const data = await resp.json();
+                this.platformSettings = data.items || [];
+            } catch (err) {
+                this.error = err.message || 'Failed to load settings';
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        /**
+         * Get a setting's value by key and property path.
+         * @param {string} key - Setting key (e.g., 'maintenance_mode')
+         * @param {string} prop - Property within the JSON value (e.g., 'enabled')
+         * @returns {*} The value or null
+         */
+        getSettingValue(key, prop) {
+            const setting = this.platformSettings.find(s => s.key === key);
+            if (!setting || !setting.value) return null;
+            try {
+                const parsed = typeof setting.value === 'string' 
+                    ? JSON.parse(setting.value) 
+                    : setting.value;
+                return parsed[prop] ?? null;
+            } catch {
+                return null;
+            }
+        },
+
+        /**
+         * Get a setting's description.
+         * @param {string} key - Setting key
+         * @returns {string} Description or empty string
+         */
+        getSettingDescription(key) {
+            const setting = this.platformSettings.find(s => s.key === key);
+            return setting?.description || '';
+        },
+
+        /**
+         * Get who last updated a setting.
+         * @param {string} key - Setting key
+         * @returns {number|null} User ID or null
+         */
+        getSettingUpdatedBy(key) {
+            const setting = this.platformSettings.find(s => s.key === key);
+            return setting?.updated_by || null;
+        },
+
+        /**
+         * Toggle maintenance mode on/off.
+         * @returns {Promise<void>}
+         */
+        async toggleMaintenanceMode() {
+            const currentValue = this.getSettingValue('maintenance_mode', 'enabled');
+            const newValue = !currentValue;
+            try {
+                const resp = await authFetch('/api/admin/settings/maintenance_mode', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ value: { enabled: newValue } }),
+                });
+                if (!resp.ok) throw new Error('Failed to update maintenance mode');
+                await this.loadSettings(); // Reload to get updated timestamp
+            } catch (err) {
+                this.error = err.message || 'Failed to toggle maintenance mode';
+            }
+        },
+
+        /**
+         * Update a setting value.
+         * @param {string} key - Setting key
+         * @param {Object} value - New value object
+         * @param {HTMLElement} input - Input element (to restore on error)
+         * @returns {Promise<void>}
+         */
+        async updateSetting(key, value, input) {
+            const originalValue = input.value;
+            try {
+                const resp = await authFetch(`/api/admin/settings/${key}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ value }),
+                });
+                if (!resp.ok) throw new Error(`Failed to update ${key}`);
+                await this.loadSettings(); // Reload to get updated setting
+            } catch (err) {
+                this.error = err.message || `Failed to update ${key}`;
+                input.value = originalValue; // Restore original on error
+            }
+        },
+
+        /** Open the create organization modal. */
+        openCreateOrgModal() {
+            this.newOrg = {
+                name: '',
+                slug: '',
+                billing_email: '',
+                billing_plan: 'free',
+                max_users: 50,
+                max_customers: 500,
+            };
+            this.showCreateOrgModal = true;
+        },
+
+        /**
+         * Create a new organization.
+         * @returns {Promise<void>}
+         */
+        async createOrganization() {
+            if (this.submitting) return;
+            this.submitting = true;
+            this.error = null;
+            try {
+                const resp = await authFetch('/api/admin/organizations', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(this.newOrg),
+                });
+                if (!resp.ok) {
+                    const data = await resp.json().catch(() => null);
+                    throw new Error(data?.detail || `Failed to create organization (${resp.status})`);
+                }
+                this.showCreateOrgModal = false;
+                await this.loadOrganizations();
+            } catch (err) {
+                this.error = err.message;
+            } finally {
+                this.submitting = false;
+            }
+        },
+
+        /**
+         * Suspend an organization.
+         * @param {number} orgId - Organization ID
+         * @returns {Promise<void>}
+         */
+        async suspendOrg(orgId) {
+            if (this.submitting) return;
+            const reason = prompt('Enter suspension reason:');
+            if (!reason || !reason.trim()) return;
+
+            this.submitting = true;
+            try {
+                const resp = await authFetch(`/api/admin/organizations/${orgId}/suspend`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reason: reason.trim() }),
+                });
+                if (!resp.ok) throw new Error('Failed to suspend organization');
+                await this.loadOrganizations();
+            } catch (err) {
+                this.error = err.message;
+            } finally {
+                this.submitting = false;
+            }
+        },
+
+        /**
+         * Reactivate a suspended organization.
+         * @param {number} orgId - Organization ID
+         * @returns {Promise<void>}
+         */
+        async unsuspendOrg(orgId) {
+            if (this.submitting) return;
+            this.submitting = true;
+            try {
+                const resp = await authFetch(`/api/admin/organizations/${orgId}/unsuspend`, {
+                    method: 'POST',
+                });
+                if (!resp.ok) throw new Error('Failed to reactivate organization');
+                await this.loadOrganizations();
+            } catch (err) {
+                this.error = err.message;
+            } finally {
+                this.submitting = false;
+            }
+        },
+
+        /**
+         * Impersonate a user via the auth service.
+         *
+         * Creates a shadow token and stores it, replacing
+         * the current session temporarily.
+         *
+         * @param {number} userId - ID of the user to impersonate
+         * @returns {Promise<void>}
+         */
+        async impersonateUser(userId) {
+            const reason = prompt('Reason for impersonation (required for audit):');
+            if (reason === null) return; // cancelled
+            if (!reason.trim()) {
+                this.error = 'A reason is required for impersonation';
+                return;
+            }
+
+            if (this.submitting) return;
+            this.submitting = true;
+            try {
+                const resp = await authFetch('/api/auth/impersonate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        target_user_id: userId,
+                        reason: reason.trim(),
+                    }),
+                });
+
+                if (!resp.ok) {
+                    const data = await resp.json().catch(() => null);
+                    throw new Error(data?.detail || 'Impersonation failed');
+                }
+
+                const data = await resp.json();
+
+                // Store original token for "return to admin" functionality
+                const currentToken = localStorage.getItem('access_token');
+                localStorage.setItem('admin_original_token', currentToken);
+                localStorage.setItem('access_token', data.access_token);
+                localStorage.setItem('impersonating', 'true');
+
+                // Redirect to calendar as the impersonated user
+                window.location.href = '/calendar';
+            } catch (err) {
+                this.error = err.message;
+            } finally {
+                this.submitting = false;
+            }
+        },
+
+        /**
+         * Open the reset password modal for a user.
+         *
+         * @param {Object} user - User object
+         * @returns {void}
+         */
+        openResetPasswordModal(user) {
+            this.resetPasswordUser = user;
+            this.resetPasswordForm = {
+                newPassword: '',
+                confirmPassword: '',
+            };
+            this.showResetPasswordModal = true;
+        },
+
+        /**
+         * Reset a user's password via the auth service.
+         *
+         * @returns {Promise<void>}
+         */
+        async resetUserPassword() {
+            // Validate passwords match
+            if (this.resetPasswordForm.newPassword !== this.resetPasswordForm.confirmPassword) {
+                this.error = 'Passwords do not match';
+                return;
+            }
+
+            // Validate minimum length
+            if (this.resetPasswordForm.newPassword.length < 8) {
+                this.error = 'Password must be at least 8 characters';
+                return;
+            }
+
+            if (this.submittingReset) return;
+            this.submittingReset = true;
+            this.error = null;
+
+            try {
+                const resp = await authFetch('/api/auth/reset-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_id: this.resetPasswordUser.id,
+                        new_password: this.resetPasswordForm.newPassword,
+                    }),
+                });
+
+                if (!resp.ok) {
+                    const data = await resp.json().catch(() => null);
+                    throw new Error(data?.detail || 'Password reset failed');
+                }
+
+                // Success!
+                this.showResetPasswordModal = false;
+                this.error = null;
+                
+                // Show success message briefly
+                const originalError = this.error;
+                this.error = `Password reset successfully for ${this.resetPasswordUser.first_name} ${this.resetPasswordUser.last_name}`;
+                setTimeout(() => {
+                    if (this.error === `Password reset successfully for ${this.resetPasswordUser.first_name} ${this.resetPasswordUser.last_name}`) {
+                        this.error = null;
+                    }
+                }, 3000);
+            } catch (err) {
+                this.error = err.message;
+            } finally {
+                this.submittingReset = false;
+            }
+        },
+    };
+}
+</script>
+{% endblock %}

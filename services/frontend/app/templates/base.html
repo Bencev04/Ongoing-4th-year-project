@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-gray-50">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - Workflow Platform</title>
+    
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- HTMX -->
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    
+    <!-- Alpine.js Collapse Plugin -->
+    <script defer src="https://unpkg.com/@alpinejs/collapse@3.x.x/dist/cdn.min.js"></script>
+    <!-- Alpine.js -->
+    <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    
+    <!-- Custom Tailwind Config -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#f0f9ff',
+                            100: '#e0f2fe',
+                            200: '#bae6fd',
+                            300: '#7dd3fc',
+                            400: '#38bdf8',
+                            500: '#0ea5e9',
+                            600: '#0284c7',
+                            700: '#0369a1',
+                            800: '#075985',
+                            900: '#0c4a6e',
+                        },
+                        navy: {
+                            50: '#f8fafc',
+                            100: '#f1f5f9',
+                            200: '#e2e8f0',
+                            300: '#cbd5e1',
+                            400: '#94a3b8',
+                            500: '#64748b',
+                            600: '#1e3a5f',
+                            700: '#1a3354',
+                            800: '#152b49',
+                            900: '#0f1f35',
+                        },
+                        teal: {
+                            50: '#f0fdfa',
+                            100: '#ccfbf1',
+                            200: '#99f6e4',
+                            300: '#5eead4',
+                            400: '#2dd4bf',
+                            500: '#14b8a6',
+                            600: '#0d9488',
+                            700: '#0f766e',
+                            800: '#115e59',
+                            900: '#134e4a',
+                        },
+                        orange: {
+                            50: '#fff7ed',
+                            100: '#ffedd5',
+                            200: '#fed7aa',
+                            300: '#fdba74',
+                            400: '#fb923c',
+                            500: '#f97316',
+                            600: '#ea580c',
+                            700: '#c2410c',
+                            800: '#9a3412',
+                            900: '#7c2d12',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- Custom Styles -->
+    <style>
+        /* HTMX loading indicator */
+        .htmx-request .htmx-indicator {
+            opacity: 1;
+        }
+        
+        .htmx-indicator {
+            opacity: 0;
+            transition: opacity 200ms ease-in;
+        }
+        
+        /* Calendar grid */
+        .calendar-day {
+            min-height: 100px;
+        }
+        
+        /* Job status colors */
+        .status-pending { background-color: #fef3c7; color: #92400e; }
+        .status-scheduled { background-color: #dbeafe; color: #1e40af; }
+        .status-in_progress { background-color: #dcfce7; color: #166534; }
+        .status-completed { background-color: #f3f4f6; color: #374151; }
+        .status-cancelled { background-color: #fee2e2; color: #991b1b; }
+        
+        /* Priority indicators */
+        .priority-urgent { border-left: 4px solid #dc2626; }
+        .priority-high { border-left: 4px solid #f97316; }
+        .priority-normal { border-left: 4px solid #14b8a6; }
+        .priority-low { border-left: 4px solid #9ca3af; }
+        
+        /* Navbar enhancements */
+        nav {
+            position: relative;
+        }
+        
+        nav::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #14b8a6 0%, #0ea5e9 50%, #14b8a6 100%);
+        }
+    </style>
+    
+    {% block head %}{% endblock %}
+</head>
+<body class="h-full" x-data="{ sidebarOpen: false, jobQueueOpen: false }">
+    <div class="min-h-full">
+        <!-- Impersonation Banner -->
+        <div id="impersonation-banner" style="display:none;"
+             class="bg-red-600 text-white text-center py-2 px-4 text-sm font-semibold relative z-50 shadow-md">
+            <div class="flex items-center justify-center space-x-3">
+                <svg class="h-5 w-5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/>
+                </svg>
+                <span>
+                    You are impersonating <strong id="impersonation-user-email"></strong>
+                    (<span id="impersonation-user-role"></span>)
+                </span>
+                <button onclick="returnToAdmin()"
+                        class="ml-4 bg-white text-red-600 hover:bg-red-50 px-3 py-1 rounded text-xs font-bold uppercase tracking-wide transition-colors">
+                    Return to Admin
+                </button>
+            </div>
+        </div>
+
+        <!-- Navigation -->
+        <nav class="bg-navy-600 shadow-lg">
+            <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+                <div class="flex h-20 items-center justify-between">
+                    <!-- Logo Section with White Background -->
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0 bg-white rounded-lg shadow-md px-4 py-2 -ml-2">
+                            <a href="/" id="logo-home-link" class="flex items-center space-x-3">
+                                <img src="/static/images/logo-icon.png" alt="Logo" class="h-14 w-14 object-contain">
+                                <div class="flex flex-col">
+                                    <span class="text-navy-700 font-bold text-xl leading-tight">Workflow</span>
+                                    <span class="text-teal-600 font-semibold text-sm leading-tight">Platform</span>
+                                </div>
+                            </a>
+                        </div>
+                        
+                        <!-- Vertical Divider -->
+                        <div class="hidden md:block h-12 w-px bg-navy-400 mx-6"></div>
+                        
+                        <!-- Desktop Nav -->
+                        <div class="hidden md:block">
+                            <div class="flex items-baseline space-x-4">
+                                <a href="/calendar" id="nav-calendar"
+                                   class="text-white hover:bg-teal-500 px-3 py-2 rounded-md text-sm font-medium transition-colors">
+                                    Calendar
+                                </a>
+                                <a href="/employees" id="nav-employees"
+                                   class="text-blue-200 hover:bg-teal-500 hover:text-white px-3 py-2 rounded-md text-sm font-medium transition-colors">
+                                    Employees
+                                </a>
+                                <a href="/customers" id="nav-customers"
+                                   class="text-blue-200 hover:bg-teal-500 hover:text-white px-3 py-2 rounded-md text-sm font-medium transition-colors">
+                                    Customers
+                                </a>
+                                <!-- Admin link — visible only to superadmin users -->
+                                <a href="/admin" id="admin-nav-link" style="display:none;"
+                                   class="text-purple-300 hover:bg-purple-500 hover:text-white px-3 py-2 rounded-md text-sm font-medium transition-colors">
+                                    Admin
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Right side -->
+                    <div class="hidden md:block">
+                        <div class="flex items-center space-x-4">
+                            <!-- Job Queue Toggle -->
+                            <button @click="jobQueueOpen = !jobQueueOpen" id="nav-job-queue"
+                                    class="text-blue-200 hover:text-white hover:bg-navy-700 p-2 rounded-md transition-colors"
+                                    title="Job Queue">
+                                <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                          d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+                                </svg>
+                            </button>
+                            
+                            <!-- User Menu -->
+                            <div class="relative" x-data="{ open: false }">
+                                <button @click="open = !open" 
+                                        class="flex items-center text-sm rounded-full text-white focus:outline-none focus:ring-2 focus:ring-teal-400 focus:ring-offset-2 focus:ring-offset-navy-600 transition-all">
+                                    <span class="sr-only">Open user menu</span>
+                                    <div class="h-10 w-10 rounded-full bg-gradient-to-br from-teal-400 to-teal-600 flex items-center justify-center shadow-md hover:shadow-lg transition-shadow">
+                                        <span class="text-base font-semibold">U</span>
+                                    </div>
+                                </button>
+                                
+                                <div x-show="open" 
+                                     @click.away="open = false"
+                                     x-transition
+                                     class="absolute right-0 mt-2 w-48 rounded-md bg-white shadow-lg ring-1 ring-black ring-opacity-5 z-50">
+                                    <a href="/profile" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors">
+                                        Your Profile
+                                    </a>
+                                    <a href="/settings" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors">
+                                        Settings
+                                    </a>
+                                    <a href="/logout" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors">
+                                        Sign out
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Mobile menu button -->
+                    <div class="md:hidden">
+                        <button @click="sidebarOpen = !sidebarOpen" 
+                                class="text-blue-200 hover:text-white hover:bg-navy-700 p-2 rounded-md transition-colors">
+                            <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                      d="M4 6h16M4 12h16M4 18h16" />
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </nav>
+        
+        <!-- Main Content -->
+        <main class="flex-1">
+            {% block content %}{% endblock %}
+        </main>
+        
+        <!-- Job Queue Sidebar -->
+        <div x-show="jobQueueOpen" 
+             x-transition:enter="transition ease-out duration-300"
+             x-transition:enter-start="translate-x-full"
+             x-transition:enter-end="translate-x-0"
+             x-transition:leave="transition ease-in duration-200"
+             x-transition:leave-start="translate-x-0"
+             x-transition:leave-end="translate-x-full"
+             class="fixed inset-y-0 right-0 w-80 bg-white shadow-xl z-40 mt-16 overflow-hidden">
+            <div class="h-full flex flex-col">
+                <!-- Header -->
+                <div class="px-4 py-3 border-b bg-gray-50 flex justify-between items-center">
+                    <h2 class="text-lg font-semibold text-gray-900">Job Queue</h2>
+                    <button @click="jobQueueOpen = false" class="text-gray-400 hover:text-gray-600">
+                        <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+                
+                <!-- Queue Content (loaded via HTMX) -->
+                <div id="job-queue-content" 
+                     hx-get="/calendar/job-queue" 
+                     hx-trigger="load, jobQueueUpdated from:body"
+                     hx-swap="innerHTML"
+                     class="flex-1 overflow-y-auto p-4">
+                    <div class="htmx-indicator text-center py-4">
+                        <svg class="animate-spin h-8 w-8 text-teal-500 mx-auto" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Overlay when sidebar is open -->
+        <div x-show="jobQueueOpen" 
+             @click="jobQueueOpen = false"
+             x-transition:enter="transition-opacity ease-out duration-300"
+             x-transition:enter-start="opacity-0"
+             x-transition:enter-end="opacity-100"
+             x-transition:leave="transition-opacity ease-in duration-200"
+             x-transition:leave-start="opacity-100"
+             x-transition:leave-end="opacity-0"
+             class="fixed inset-0 bg-black bg-opacity-25 z-30 mt-16">
+        </div>
+    </div>
+    
+    <!-- Modal Container -->
+    <div id="modal-container"></div>
+    
+    <!-- Toast Notifications -->
+    <div id="toast-container" 
+         class="fixed bottom-4 right-4 z-50 space-y-2"
+         x-data="{ toasts: [] }">
+    </div>
+    
+    <!-- Global Scripts -->
+    <script>
+        /**
+         * Auth helper — retrieve stored access token.
+         * @returns {string|null}
+         */
+        function getAccessToken() {
+            return localStorage.getItem('access_token');
+        }
+
+        /**
+         * Try to refresh the access token using the stored refresh token.
+         * @returns {string|null} new access token, or null on failure.
+         */
+        async function refreshAccessToken() {
+            const refreshToken = localStorage.getItem('refresh_token');
+            if (!refreshToken) return null;
+
+            try {
+                const res = await fetch('/api/auth/refresh', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ refresh_token: refreshToken })
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    localStorage.setItem('access_token', data.access_token);
+                    return data.access_token;
+                }
+            } catch (e) {
+                console.error('Token refresh failed:', e);
+            }
+            return null;
+        }
+
+        /**
+         * Wrapper around fetch() that injects the Bearer token and
+         * attempts a single silent refresh on 401.
+         */
+        async function authFetch(url, options = {}) {
+            const token = getAccessToken();
+            if (token) {
+                options.headers = options.headers || {};
+                options.headers['Authorization'] = 'Bearer ' + token;
+            }
+
+            let response = await fetch(url, options);
+
+            // On 401, try to refresh once then retry
+            if (response.status === 401) {
+                const newToken = await refreshAccessToken();
+                if (newToken) {
+                    options.headers['Authorization'] = 'Bearer ' + newToken;
+                    response = await fetch(url, options);
+                } else {
+                    // Refresh failed — redirect to login
+                    localStorage.clear();
+                    window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+                    return response;
+                }
+            }
+            return response;
+        }
+
+        // ----- HTMX configuration -----
+        document.body.addEventListener('htmx:configRequest', (event) => {
+            // Inject Bearer token into every HTMX request
+            const token = getAccessToken();
+            if (token) {
+                event.detail.headers['Authorization'] = 'Bearer ' + token;
+            }
+        });
+
+        // Handle HTMX 401 — redirect to login
+        document.body.addEventListener('htmx:responseError', (event) => {
+            if (event.detail.xhr && event.detail.xhr.status === 401) {
+                localStorage.clear();
+                window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+                return;
+            }
+            console.error('HTMX Error:', event.detail);
+        });
+
+        // Close modal on escape key
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                document.getElementById('modal-container').innerHTML = '';
+            }
+        });
+
+        // Handle logout link — clear tokens then navigate
+        document.addEventListener('click', (event) => {
+            const link = event.target.closest('a[href="/logout"]');
+            if (link) {
+                event.preventDefault();
+                localStorage.clear();
+                window.location.href = '/login';
+            }
+        });
+
+        /**
+         * Get the current user's role from the stored JWT.
+         * @returns {string|null} The role string, or null if unavailable.
+         */
+        function getUserRole() {
+            try {
+                const token = getAccessToken();
+                if (!token) return null;
+                const payload = JSON.parse(atob(token.split('.')[1]));
+                return payload.role || null;
+            } catch (_) { return null; }
+        }
+
+        /**
+         * Return to the superadmin session after impersonation.
+         * Restores the original admin token and redirects to /admin.
+         */
+        function returnToAdmin() {
+            const originalToken = localStorage.getItem('admin_original_token');
+            if (originalToken) {
+                localStorage.setItem('access_token', originalToken);
+                localStorage.removeItem('admin_original_token');
+                localStorage.removeItem('impersonating');
+                window.location.href = '/admin';
+            }
+        }
+
+        // ----- Impersonation banner visibility -----
+        // Decode the JWT and check for impersonator_id claim.
+        // If present, the superadmin is viewing the app as another user.
+        (function showImpersonationBanner() {
+            try {
+                const token = getAccessToken();
+                if (!token) return;
+                const payload = JSON.parse(atob(token.split('.')[1]));
+                if (payload.impersonator_id) {
+                    const banner = document.getElementById('impersonation-banner');
+                    const emailSpan = document.getElementById('impersonation-user-email');
+                    const roleSpan = document.getElementById('impersonation-user-role');
+                    if (banner) {
+                        emailSpan.textContent = payload.email || 'unknown';
+                        roleSpan.textContent = payload.role || 'unknown';
+                        banner.style.display = '';
+                    }
+                }
+            } catch (_) { /* ignore — banner stays hidden */ }
+        })();
+
+        // ----- Role-based nav visibility -----
+        // Decode the JWT to check the role without a network call.
+        // Superadmin: show Admin link, hide tenant-specific links (Employees, Customers, Job Queue).
+        (function adjustNavForRole() {
+            try {
+                const token = getAccessToken();
+                if (!token) return;
+                const payload = JSON.parse(atob(token.split('.')[1]));
+                if (payload.role === 'superadmin') {
+                    const adminLink = document.getElementById('admin-nav-link');
+                    if (adminLink) adminLink.style.display = '';
+
+                    // Hide tenant-specific pages — superadmin has no owner_id
+                    ['nav-calendar', 'nav-employees', 'nav-customers', 'nav-job-queue'].forEach(id => {
+                        const el = document.getElementById(id);
+                        if (el) el.style.display = 'none';
+                    });
+
+                    // Point the logo home link to /admin instead of /
+                    const logoLink = document.getElementById('logo-home-link');
+                    if (logoLink) logoLink.href = '/admin';
+                }
+            } catch (_) { /* ignore — nav stays at defaults */ }
+        })();
+    </script>
+    
+    {% block scripts %}{% endblock %}
+</body>
+</html>

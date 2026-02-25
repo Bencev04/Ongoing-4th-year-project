@@ -1,0 +1,108 @@
+{#
+  Calendar Grid Partial
+
+  HTMX swappable partial that renders the monthly calendar grid.
+
+  Template Variables:
+  - weekdays: List of weekday names (Mon-Sun)
+  - calendar_days: List of 42 day objects with:
+    - date: Python date object
+    - day: Day number (1-31)
+    - is_current_month: Boolean indicating if day belongs to the displayed month
+    - is_today: Boolean indicating if this is today's date
+    - events: List of scheduled events/jobs for this day
+  - year: Current displayed year
+  - month: Current displayed month (1-12)
+
+  Features:
+  - Displays 6-week calendar grid (42 cells total)
+  - Highlights today's date with primary color
+  - Shows up to 3 events per day with overflow indicator
+  - Supports drag-and-drop job rescheduling
+  - Double-click opens day detail view
+  - Single-click on events opens job modal
+#}
+
+<!-- Weekday Headers -->
+<div class="grid grid-cols-7 border-b bg-gray-50">
+    {% for day in weekdays %}
+    <div class="px-4 py-3 text-center text-sm font-semibold text-gray-700
+                {# Dim weekend column headers #}
+                {% if loop.index > 5 %}text-gray-500{% endif %}">
+        {{ day }}
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Calendar Days Grid (6 weeks × 7 days = 42 cells) -->
+<div class="grid grid-cols-7 border-l">
+    {% for day in calendar_days %}
+    <div class="calendar-day border-r border-b p-2
+                {# Dim days from adjacent months #}
+                {% if not day.is_current_month %}bg-gray-50{% endif %}
+                {# Highlight today's date #}
+                {% if day.is_today %}bg-blue-50 ring-2 ring-inset ring-primary-500{% endif %}
+                hover:bg-gray-100 transition-colors cursor-pointer"
+         @click="selectDay('{{ day.date.strftime('%Y-%m-%d') }}')"
+         @dragover.prevent="handleDragOver($event)"
+         @drop="handleDrop($event, '{{ day.date.strftime('%Y-%m-%d') }}')"
+         hx-get="/calendar/day/{{ day.date.strftime('%Y-%m-%d') }}"
+         hx-target="#modal-container"
+         hx-trigger="dblclick">
+
+        <!-- Day Number -->
+        <div class="flex items-center justify-between mb-1">
+            <span class="text-sm font-medium
+                        {% if day.is_today %}
+                            text-white bg-primary-600 rounded-full w-7 h-7 flex items-center justify-center
+                        {% elif not day.is_current_month %}
+                            text-gray-400
+                        {% else %}
+                            text-gray-900
+                        {% endif %}">
+                {{ day.day }}
+            </span>
+
+            {# Show overflow indicator if more than 3 events exist #}
+            {% if day.events|length > 3 %}
+            <span class="text-xs text-gray-500">+{{ day.events|length - 3 }} more</span>
+            {% endif %}
+        </div>
+        
+        <!-- Events Container -->
+        <div class="space-y-1">
+            {% for event in day.events[:3] %}
+            <div class="text-xs p-1 rounded truncate cursor-pointer
+                        priority-{{ event.priority }}
+                        {% if event.status == 'pending' %}
+                            status-pending
+                        {% elif event.status == 'scheduled' %}
+                            status-scheduled
+                        {% elif event.status == 'in_progress' %}
+                            status-in_progress
+                        {% elif event.status == 'completed' %}
+                            status-completed
+                        {% else %}
+                            status-cancelled
+                        {% endif %}"
+                 draggable="true"
+                 @dragstart="handleDragStart($event, {{ event.id }})"
+                 hx-get="/calendar/job-modal?job_id={{ event.id }}"
+                 hx-target="#modal-container"
+                 hx-trigger="click"
+                 title="{{ event.title }}">
+                {# Display start time if it exists #}
+                {% if event.start_time %}
+                <span class="font-medium">{{ event.start_time.strftime('%H:%M') }}</span>
+                {% endif %}
+                {{ event.title }}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+{# Hidden inputs to store current navigation state for HTMX requests #}
+<input type="hidden" id="current-year" value="{{ year }}">
+<input type="hidden" id="current-month" value="{{ month }}">

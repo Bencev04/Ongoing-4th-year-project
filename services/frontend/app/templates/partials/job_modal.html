@@ -1,0 +1,265 @@
+<!-- Job Create/Edit Modal (HTMX partial) -->
+
+<div class="fixed inset-0 z-50 overflow-y-auto" 
+     x-data="{ open: true }"
+     x-show="open"
+     x-transition:enter="ease-out duration-300"
+     x-transition:enter-start="opacity-0"
+     x-transition:enter-end="opacity-100"
+     x-transition:leave="ease-in duration-200"
+     x-transition:leave-start="opacity-100"
+     x-transition:leave-end="opacity-0">
+    
+    <!-- Backdrop -->
+    <div class="fixed inset-0 bg-black bg-opacity-50" 
+         @click="open = false; setTimeout(() => document.getElementById('modal-container').innerHTML = '', 200)">
+    </div>
+    
+    <!-- Modal Content -->
+    <div class="flex min-h-full items-center justify-center p-4">
+        <div class="relative bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden"
+             @click.stop
+             x-transition:enter="ease-out duration-300"
+             x-transition:enter-start="opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95"
+             x-transition:enter-end="opacity-100 translate-y-0 sm:scale-100"
+             x-transition:leave="ease-in duration-200"
+             x-transition:leave-start="opacity-100 translate-y-0 sm:scale-100"
+             x-transition:leave-end="opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95">
+            
+            <!-- Modal Header -->
+            <div class="px-6 py-4 border-b bg-gray-50 flex items-center justify-between">
+                <h3 class="text-lg font-semibold text-gray-900">
+                    {% if is_edit %}Edit Job{% else %}Create New Job{% endif %}
+                </h3>
+                <button @click="open = false; setTimeout(() => document.getElementById('modal-container').innerHTML = '', 200)"
+                        class="text-gray-400 hover:text-gray-600">
+                    <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            
+            <!-- Modal Body -->
+            <form hx-post="/api/jobs{% if is_edit %}/{{ job.id }}{% endif %}"
+                  hx-swap="none"
+                  hx-on::after-request="htmx.trigger(document.body, 'jobQueueUpdated'); document.getElementById('modal-container').innerHTML = ''"
+                  class="overflow-y-auto max-h-[calc(90vh-140px)]">
+                
+                <div class="px-6 py-4 space-y-6">
+                    <!-- Title -->
+                    <div>
+                        <label for="title" class="block text-sm font-medium text-gray-700 mb-1">
+                            Job Title <span class="text-red-500">*</span>
+                        </label>
+                        <input type="text" 
+                               id="title" 
+                               name="title" 
+                               required
+                               value="{{ job.title if job else '' }}"
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500"
+                               placeholder="e.g., Kitchen Renovation">
+                    </div>
+                    
+                    <!-- Description -->
+                    <div>
+                        <label for="description" class="block text-sm font-medium text-gray-700 mb-1">
+                            Description
+                        </label>
+                        <textarea id="description" 
+                                  name="description" 
+                                  rows="3"
+                                  class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500"
+                                  placeholder="Job details...">{{ job.description if job else '' }}</textarea>
+                    </div>
+                    
+                    <!-- Date and Time Row -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="start_date" class="block text-sm font-medium text-gray-700 mb-1">
+                                Start Date
+                            </label>
+                            <input type="date" 
+                                   id="start_date" 
+                                   name="start_date"
+                                   value="{{ date if date else (job.start_time.strftime('%Y-%m-%d') if job and job.start_time else '') }}"
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500">
+                        </div>
+                        <div>
+                            <label for="start_time" class="block text-sm font-medium text-gray-700 mb-1">
+                                Start Time
+                            </label>
+                            <input type="time" 
+                                   id="start_time" 
+                                   name="start_time"
+                                   value="{{ job.start_time.strftime('%H:%M') if job and job.start_time else '09:00' }}"
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500">
+                        </div>
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="end_date" class="block text-sm font-medium text-gray-700 mb-1">
+                                End Date
+                            </label>
+                            <input type="date" 
+                                   id="end_date" 
+                                   name="end_date"
+                                   value="{{ date if date else (job.end_time.strftime('%Y-%m-%d') if job and job.end_time else '') }}"
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500">
+                        </div>
+                        <div>
+                            <label for="end_time" class="block text-sm font-medium text-gray-700 mb-1">
+                                End Time
+                            </label>
+                            <input type="time" 
+                                   id="end_time" 
+                                   name="end_time"
+                                   value="{{ job.end_time.strftime('%H:%M') if job and job.end_time else '17:00' }}"
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500">
+                        </div>
+                    </div>
+                    
+                    <!-- Priority and Status Row -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="priority" class="block text-sm font-medium text-gray-700 mb-1">
+                                Priority
+                            </label>
+                            <select id="priority" 
+                                    name="priority"
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500">
+                                <option value="low" {% if job and job.priority == 'low' %}selected{% endif %}>Low</option>
+                                <option value="normal" {% if not job or job.priority == 'normal' %}selected{% endif %}>Normal</option>
+                                <option value="high" {% if job and job.priority == 'high' %}selected{% endif %}>High</option>
+                                <option value="urgent" {% if job and job.priority == 'urgent' %}selected{% endif %}>Urgent</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="status" class="block text-sm font-medium text-gray-700 mb-1">
+                                Status
+                            </label>
+                            <select id="status" 
+                                    name="status"
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500">
+                                <option value="pending" {% if not job or job.status == 'pending' %}selected{% endif %}>Pending</option>
+                                <option value="scheduled" {% if job and job.status == 'scheduled' %}selected{% endif %}>Scheduled</option>
+                                <option value="in_progress" {% if job and job.status == 'in_progress' %}selected{% endif %}>In Progress</option>
+                                <option value="completed" {% if job and job.status == 'completed' %}selected{% endif %}>Completed</option>
+                                <option value="cancelled" {% if job and job.status == 'cancelled' %}selected{% endif %}>Cancelled</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <!-- Assignment Row -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="assigned_employee_id" class="block text-sm font-medium text-gray-700 mb-1">
+                                Assign To
+                            </label>
+                            <select id="assigned_employee_id" 
+                                    name="assigned_employee_id"
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500">
+                                <option value="">-- Select Employee --</option>
+                                <!-- TODO: Populate from user service -->
+                            </select>
+                        </div>
+                        <div>
+                            <label for="customer_id" class="block text-sm font-medium text-gray-700 mb-1">
+                                Customer
+                            </label>
+                            <select id="customer_id" 
+                                    name="customer_id"
+                                    class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500">
+                                <option value="">-- Select Customer --</option>
+                                <!-- TODO: Populate from customer service -->
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <!-- Location -->
+                    <div>
+                        <label for="location" class="block text-sm font-medium text-gray-700 mb-1">
+                            Location
+                        </label>
+                        <input type="text" 
+                               id="location" 
+                               name="location"
+                               value="{{ job.location if job else '' }}"
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500"
+                               placeholder="123 Main Street, Dublin">
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="eircode" class="block text-sm font-medium text-gray-700 mb-1">
+                                Eircode
+                            </label>
+                            <input type="text" 
+                                   id="eircode" 
+                                   name="eircode"
+                                   value="{{ job.eircode if job else '' }}"
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500"
+                                   placeholder="D02 XY45">
+                        </div>
+                        <div>
+                            <label for="estimated_duration" class="block text-sm font-medium text-gray-700 mb-1">
+                                Estimated Duration (minutes)
+                            </label>
+                            <input type="number" 
+                                   id="estimated_duration" 
+                                   name="estimated_duration"
+                                   min="0"
+                                   value="{{ job.estimated_duration if job else '' }}"
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500"
+                                   placeholder="240">
+                        </div>
+                    </div>
+                    
+                    <!-- Notes -->
+                    <div>
+                        <label for="notes" class="block text-sm font-medium text-gray-700 mb-1">
+                            Internal Notes
+                        </label>
+                        <textarea id="notes" 
+                                  name="notes" 
+                                  rows="2"
+                                  class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500"
+                                  placeholder="Notes for your team...">{{ job.notes if job else '' }}</textarea>
+                    </div>
+                    
+                    <!-- Hidden fields -->
+                    <input type="hidden" name="owner_id" value="1">
+                    <input type="hidden" name="created_by_id" value="1">
+                </div>
+                
+                <!-- Modal Footer -->
+                <div class="px-6 py-4 border-t bg-gray-50 flex justify-between">
+                    {% if is_edit %}
+                    <button type="button"
+                            hx-delete="/api/jobs/{{ job.id }}"
+                            hx-confirm="Are you sure you want to delete this job?"
+                            hx-swap="none"
+                            hx-on::after-request="htmx.trigger(document.body, 'jobQueueUpdated'); document.getElementById('modal-container').innerHTML = ''"
+                            class="px-4 py-2 text-sm font-medium text-red-600 hover:text-red-700">
+                        Delete
+                    </button>
+                    {% else %}
+                    <div></div>
+                    {% endif %}
+                    
+                    <div class="flex space-x-3">
+                        <button type="button"
+                                @click="open = false; setTimeout(() => document.getElementById('modal-container').innerHTML = '', 200)"
+                                class="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50">
+                            Cancel
+                        </button>
+                        <button type="submit"
+                                class="px-4 py-2 text-sm font-medium text-white bg-orange-500 rounded-md hover:bg-orange-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-400">
+                            {% if is_edit %}Save Changes{% else %}Create Job{% endif %}
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>

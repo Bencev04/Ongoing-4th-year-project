@@ -1,0 +1,40 @@
+# =============================================================================
+# Trivy Scanner Configuration
+# =============================================================================
+# Used by both `trivy fs` (code/dependency scan) and `trivy image` (image scan).
+# Reference: https://aquasecurity.github.io/trivy/latest/docs/references/configuration/config-file/
+#
+# Policy:
+#   - Block pipeline on CRITICAL severity only
+#   - Report HIGH as warnings (visible in artifacts, doesn't fail)
+#   - Ignore unfixed vulnerabilities (no available patch = nothing actionable)
+
+severity:
+  - CRITICAL
+
+exit-code: 1
+
+# Don't fail on vulnerabilities that have no fix available yet
+ignore-unfixed: true
+
+# Output format for CI console
+format: table
+
+# Scan targets
+scan:
+  # Skip directories that aren't relevant
+  skip-dirs:
+    - .git
+    - .venv
+    - node_modules
+    - __pycache__
+    - .pytest_cache
+    - htmlcov
+    - .scannerwork
+
+# Vulnerability database
+db:
+  skip-update: false
+
+# Timeout for large scans
+timeout: 10m0s

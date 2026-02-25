@@ -1,0 +1,61 @@
+# CI/CD Docker Compose Override — Pre-Built Images
+#
+# Usage (main branch CI only):
+#   docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml -f ci/docker-compose.ci-prebuilt.yml up -d
+#
+# Purpose:
+#   Overrides service build directives with pre-built images from the container
+#   registry. Used by the integration-tests job on main so it pulls images built
+#   in the build stage instead of rebuilding from scratch.
+#
+#   This eliminates the double-build problem: images are built once in the
+#   build stage, then reused for integration testing and deployment.
+#
+# Note:
+#   - Requires IMAGE_TAG and IMAGE_VERSION environment variables (set in .gitlab-ci.yml)
+#   - db, redis, and integration-runner are NOT overridden:
+#     - db/redis are third-party images (postgres:15-alpine, redis:7-alpine)
+#     - integration-runner must still build from tests/integration/Dockerfile
+#
+# Layering order matters:
+#   1. docker-compose.yml          — base service definitions (with build: directives)
+#   2. ci/docker-compose.ci.yml    — CI overrides (restart, env, healthchecks, integration-runner)
+#   3. ci/docker-compose.ci-prebuilt.yml  — adds image: tags for pre-built images
+#
+# How it works:
+#   When both build: and image: exist, Docker Compose behaviour depends on flags:
+#     - `docker compose up` (no --build): uses the image if it exists locally
+#     - `docker compose up --build`: rebuilds from Dockerfile (ignores image)
+#   The CI job pulls images first, then runs `up` WITHOUT --build.
+#   The integration-runner is excluded — it still builds from tests/integration/Dockerfile.
+
+services:
+  nginx-gateway:
+    image: "${IMAGE_TAG}/nginx:${IMAGE_VERSION}"
+
+  user-db-access-service:
+    image: "${IMAGE_TAG}/user-db-access-service:${IMAGE_VERSION}"
+
+  customer-db-access-service:
+    image: "${IMAGE_TAG}/customer-db-access-service:${IMAGE_VERSION}"
+
+  job-db-access-service:
+    image: "${IMAGE_TAG}/job-db-access-service:${IMAGE_VERSION}"
+
+  auth-service:
+    image: "${IMAGE_TAG}/auth-service:${IMAGE_VERSION}"
+
+  user-bl-service:
+    image: "${IMAGE_TAG}/user-bl-service:${IMAGE_VERSION}"
+
+  job-bl-service:
+    image: "${IMAGE_TAG}/job-bl-service:${IMAGE_VERSION}"
+
+  customer-bl-service:
+    image: "${IMAGE_TAG}/customer-bl-service:${IMAGE_VERSION}"
+
+  admin-bl-service:
+    image: "${IMAGE_TAG}/admin-bl-service:${IMAGE_VERSION}"
+
+  frontend:
+    image: "${IMAGE_TAG}/frontend:${IMAGE_VERSION}"

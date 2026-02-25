@@ -1,0 +1,179 @@
+# CI/CD Docker Compose Override
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml up -d
+#
+# Purpose:
+#   Overrides the main docker-compose.yml for CI environments:
+#   - Removes host port mappings (not needed in CI)
+#   - Sets restart: "no" (fail fast rather than retry)
+#   - Pins deterministic environment variables (no .env file in CI)
+#   - Adds an integration-runner container that runs tests inside the network
+
+services:
+  # ---------------------------------------------------------------------------
+  # Override: NGINX — remove host port, use expose only
+  # ---------------------------------------------------------------------------
+  nginx-gateway:
+    restart: "no"
+    build:
+      context: ./services
+      dockerfile: nginx/Dockerfile
+      args:
+        NGINX_CONF: nginx/nginx-ci.conf
+    healthcheck:
+      interval: 2s
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Override: PostgreSQL — remove host port exposure
+  # ---------------------------------------------------------------------------
+  db:
+    restart: "no"
+    environment:
+      POSTGRES_USER: crm_user
+      POSTGRES_PASSWORD: crm_password
+      POSTGRES_DB: crm_calendar
+    healthcheck:
+      interval: 2s
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # Override: Redis — no changes needed (already internal-only)
+  # ---------------------------------------------------------------------------
+  redis:
+    restart: "no"
+    healthcheck:
+      interval: 2s
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Override: All application services — fail fast, deterministic env
+  # ---------------------------------------------------------------------------
+  user-db-access-service:
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  customer-db-access-service:
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  job-db-access-service:
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  auth-service:
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  user-bl-service:
+    restart: "no"
+    environment:
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      REDIS_URL: redis://redis:6379/1
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  job-bl-service:
+    restart: "no"
+    environment:
+      JOB_SERVICE_URL: http://job-db-access-service:8003
+      CUSTOMER_SERVICE_URL: http://customer-db-access-service:8002
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      REDIS_URL: redis://redis:6379/2
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  customer-bl-service:
+    restart: "no"
+    environment:
+      CUSTOMER_SERVICE_URL: http://customer-db-access-service:8002
+      JOB_SERVICE_URL: http://job-db-access-service:8003
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      REDIS_URL: redis://redis:6379/3
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  admin-bl-service:
+    restart: "no"
+    environment:
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      REDIS_URL: redis://redis:6379/4
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  frontend:
+    restart: "no"
+    environment:
+      USER_SERVICE_URL: http://user-bl-service:8004
+      CUSTOMER_SERVICE_URL: http://customer-bl-service:8007
+      JOB_SERVICE_URL: http://job-bl-service:8006
+      AUTH_SERVICE_URL: http://auth-service:8005
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # NEW: Integration test runner
+  # ---------------------------------------------------------------------------
+  integration-runner:
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile
+    container_name: crm_integration_runner
+    working_dir: /tests
+    environment:
+      INTEGRATION_BASE_URL: http://nginx-gateway
+    volumes:
+      - integration-results:/tests/results
+    depends_on:
+      nginx-gateway:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - crm_network
+
+volumes:
+  integration-results:

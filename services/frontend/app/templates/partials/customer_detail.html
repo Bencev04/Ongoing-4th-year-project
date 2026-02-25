@@ -1,0 +1,80 @@
+{# ==========================================================================
+   Customer Detail Panel (HTMX Partial)
+   --------------------------------------------------------------------------
+   Displayed in the slide-over when a customer row is clicked.
+   Expects ``customer_id`` in the template context.
+   Alpine.js on the parent page fetches the enriched customer data and
+   populates the panel.
+   ========================================================================== #}
+
+<div x-data="{ loaded: false, customer: null }"
+     x-init="
+         const resp = await authFetch('/api/customers/{{ customer_id }}');
+         if (resp.ok) { customer = await resp.json(); loaded = true; }
+     ">
+
+    {# Loading indicator #}
+    <div x-show="!loaded" class="p-6 text-center">
+        <svg class="animate-spin h-8 w-8 text-teal-600 mx-auto" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+    </div>
+
+    {# Detail content #}
+    <div x-show="loaded && customer" class="p-6 space-y-6">
+        {# Contact header #}
+        <div class="flex items-center space-x-4">
+            <div class="h-14 w-14 rounded-full bg-teal-100 flex items-center justify-center">
+                <span class="text-lg font-semibold text-teal-700"
+                      x-text="((customer?.first_name?.[0] || '') + (customer?.last_name?.[0] || '')).toUpperCase()"></span>
+            </div>
+            <div>
+                <h3 class="text-lg font-semibold text-gray-900"
+                    x-text="(customer?.first_name || '') + ' ' + (customer?.last_name || '')"></h3>
+                <p class="text-sm text-gray-500" x-text="customer?.company || ''"></p>
+            </div>
+        </div>
+
+        {# Info list #}
+        <dl class="divide-y divide-gray-200">
+            <div class="py-3 flex justify-between text-sm" x-show="customer?.email">
+                <dt class="text-gray-500">Email</dt>
+                <dd><a :href="'mailto:' + customer?.email" class="text-teal-600" x-text="customer?.email"></a></dd>
+            </div>
+            <div class="py-3 flex justify-between text-sm" x-show="customer?.phone">
+                <dt class="text-gray-500">Phone</dt>
+                <dd><a :href="'tel:' + customer?.phone" class="text-teal-600" x-text="customer?.phone"></a></dd>
+            </div>
+            <div class="py-3 flex justify-between text-sm" x-show="customer?.address">
+                <dt class="text-gray-500">Address</dt>
+                <dd class="text-right" x-text="customer?.address"></dd>
+            </div>
+            <div class="py-3 flex justify-between text-sm" x-show="customer?.eircode">
+                <dt class="text-gray-500">Eircode</dt>
+                <dd x-text="customer?.eircode"></dd>
+            </div>
+        </dl>
+
+        {# Recent jobs #}
+        <div x-show="(customer?.recent_jobs || []).length > 0">
+            <h4 class="text-sm font-semibold text-gray-900 mb-2">Recent Jobs</h4>
+            <ul class="space-y-2">
+                <template x-for="job in (customer?.recent_jobs || [])" :key="job.id">
+                    <li class="flex items-center justify-between bg-gray-50 rounded px-3 py-2 text-sm">
+                        <span x-text="job.title"></span>
+                        <span class="text-xs font-medium"
+                              :class="{
+                                  'text-yellow-700': job.status === 'pending',
+                                  'text-blue-700':   job.status === 'scheduled',
+                                  'text-green-700':  job.status === 'in_progress',
+                                  'text-gray-600':   job.status === 'completed',
+                              }"
+                              x-text="job.status?.replace('_',' ')"></span>
+                    </li>
+                </template>
+            </ul>
+        </div>
+    </div>
+</div>

@@ -1,0 +1,649 @@
+# =============================================================================
+# CRM Calendar Microservices — GitLab CI/CD Pipeline
+# =============================================================================
+#
+# Pipeline Architecture (8 stages):
+#
+#   Feature branches: test → quality  (~3-5 min fast feedback)
+#   Main branch:      test → quality → security:code → build → integration → scan:image → deploy
+#
+# Decision rationale:
+#   - Feature branches get fast feedback: unit tests + Trivy code scan + SonarQube
+#   - SonarQube runs on all branches (Community Branch Plugin for multi-branch support)
+#   - Aikido source scan (SAST, SCA, secrets) catches security issues before building
+#   - Docker images are built ONCE, then reused for integration tests (no double-build)
+#   - Integration tests pull pre-built images via ci/docker-compose.ci-prebuilt.yml
+#   - Aikido release gate registers the release for continuous monitoring + image scanning
+#   - Trivy remains on all branches for fast, free, offline security scanning
+
+stages:
+  - test             # Unit tests + Trivy code scan per service (all branches)
+  - quality          # SonarQube static analysis (all branches)
+  - security:code    # Aikido source-level security scan (main only)
+  - build            # Docker image builds (main only)
+  - integration      # Integration tests against pre-built images (main only)
+  - scan:image       # Trivy image scan + Aikido release gate & monitoring (main only)
+  - deploy           # Trigger deployment repo (main only, manual gate)
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  # Container registry — works with GitLab CR or Docker Hub
+  # Override CI_REGISTRY_IMAGE in project settings if using Docker Hub
+  IMAGE_TAG: "$CI_REGISTRY_IMAGE"
+  IMAGE_VERSION: "$CI_COMMIT_SHORT_SHA"
+
+# =============================================================================
+# DEFAULT — shared settings for Python-based jobs
+# =============================================================================
+
+default:
+  image: python:3.11-slim
+  cache:
+    key:
+      files:
+        - "**/requirements.txt"
+    paths:
+      - .cache/pip
+  before_script:
+    - pip install --upgrade pip
+
+# =============================================================================
+# STAGE 1: UNIT TESTS — run per-service tests (ALL branches)
+# =============================================================================
+# Each service runs in parallel. DB-access services spin up Postgres.
+# Coverage reports (Cobertura XML) are passed as artifacts to the quality stage.
+# Runs on every branch push so developers get immediate feedback.
+
+test:auth-service:
+  stage: test
+  needs: []
+  script:
+    - cd services/auth-service
+    - pip install -r requirements.txt
+    - pytest app/tests/ -n auto --cov=app --cov-report=xml:../../services/auth-service/coverage.xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/auth-service/coverage.xml
+    paths:
+      - services/auth-service/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:admin-bl-service:
+  stage: test
+  needs: []
+  script:
+    - cd services/admin-bl-service
+    - pip install -r requirements.txt
+    - pytest app/tests/ -n auto --cov=app --cov-report=xml:../../services/admin-bl-service/coverage.xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/admin-bl-service/coverage.xml
+    paths:
+      - services/admin-bl-service/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:customer-db-access-service:
+  stage: test
+  needs: []
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: testuser
+    POSTGRES_PASSWORD: testpass
+    DATABASE_URL: "postgresql://testuser:testpass@postgres:5432/test_db"
+  script:
+    - cd services/customer-db-access-service
+    - pip install -r requirements.txt
+    - pytest tests/ -n auto --cov=app --cov-report=xml:../../services/customer-db-access-service/coverage.xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/customer-db-access-service/coverage.xml
+    paths:
+      - services/customer-db-access-service/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:customer-bl-service:
+  stage: test
+  needs: []
+  script:
+    - cd services/customer-bl-service
+    - pip install -r requirements.txt
+    - pytest app/tests/ -n auto --cov=app --cov-report=xml:../../services/customer-bl-service/coverage.xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/customer-bl-service/coverage.xml
+    paths:
+      - services/customer-bl-service/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:job-db-access-service:
+  stage: test
+  needs: []
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: testuser
+    POSTGRES_PASSWORD: testpass
+    DATABASE_URL: "postgresql://testuser:testpass@postgres:5432/test_db"
+  script:
+    - cd services/job-db-access-service
+    - pip install -r requirements.txt
+    - pytest tests/ -n auto --cov=app --cov-report=xml:../../services/job-db-access-service/coverage.xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/job-db-access-service/coverage.xml
+    paths:
+      - services/job-db-access-service/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:job-bl-service:
+  stage: test
+  needs: []
+  script:
+    - cd services/job-bl-service
+    - pip install -r requirements.txt
+    - pytest app/tests/ -n auto --cov=app --cov-report=xml:../../services/job-bl-service/coverage.xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/job-bl-service/coverage.xml
+    paths:
+      - services/job-bl-service/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:user-db-access-service:
+  stage: test
+  needs: []
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: testuser
+    POSTGRES_PASSWORD: testpass
+    DATABASE_URL: "postgresql://testuser:testpass@postgres:5432/test_db"
+  script:
+    - cd services/user-db-access-service
+    - pip install -r requirements.txt
+    - pytest tests/ -n auto --cov=app --cov-report=xml:../../services/user-db-access-service/coverage.xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/user-db-access-service/coverage.xml
+    paths:
+      - services/user-db-access-service/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:user-bl-service:
+  stage: test
+  needs: []
+  script:
+    - cd services/user-bl-service
+    - pip install -r requirements.txt
+    - pytest app/tests/ -n auto --cov=app --cov-report=xml:../../services/user-bl-service/coverage.xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/user-bl-service/coverage.xml
+    paths:
+      - services/user-bl-service/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:frontend:
+  stage: test
+  needs: []
+  script:
+    - cd services/frontend
+    - pip install -r requirements.txt
+    - pytest app/tests/ -n auto --cov=app --cov-report=xml:../../services/frontend/coverage.xml --cov-fail-under=80
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/frontend/coverage.xml
+    paths:
+      - services/frontend/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# =============================================================================
+# STAGE 2: CODE QUALITY — SonarQube static analysis (all branches)
+# =============================================================================
+# Runs after unit tests so it can consume coverage.xml artifacts.
+# Uses sonar-project.properties at the repo root.
+#
+# Decision: Runs on all branches thanks to the Community Branch Plugin,
+# which adds multi-branch analysis support to SonarQube Community edition.
+# Developers get quality feedback on feature branches before merging.
+#
+# Prerequisites:
+#   - SONAR_HOST_URL set in GitLab CI/CD variables (e.g., http://sonarqube:9000)
+#   - SONAR_TOKEN set in GitLab CI/CD variables (masked)
+
+sonarqube-analysis:
+  stage: quality
+  image:
+    name: sonarsource/sonar-scanner-cli:11
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"  # Full clone needed for blame/history analysis
+  cache:
+    policy: pull-push
+    key: "sonar-cache-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "${SONAR_USER_HOME}/cache"
+      - sonar-scanner/
+  before_script: []  # Override default pip install
+  script:
+    - sonar-scanner -Dsonar.host.url="${SONAR_HOST_URL}" -Dproject.settings=ci/sonar-project.properties
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# =============================================================================
+# STAGE 1b: TRIVY CODE SCAN — filesystem/dependency scan (ALL branches, parallel with unit tests)
+# =============================================================================
+# Scans Python dependencies (requirements.txt) and source code for known CVEs.
+# This catches vulnerable packages BEFORE Docker images are built.
+#
+# Decision: CRITICAL severity only blocks the pipeline. HIGH is reported in
+# the JSON artifact but doesn't fail the build. This avoids false-positive
+# fatigue while catching genuinely dangerous vulnerabilities.
+
+trivy-code-scan:
+  stage: test
+  needs: []
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  before_script: []  # Override default — Trivy doesn't need pip
+  script:
+    # Scan for CRITICAL vulns (exit 1 if found)
+    - trivy fs --config ci/.trivy.yaml --severity CRITICAL --exit-code 1 --format table ./services/
+    # Also produce a full report (HIGH + CRITICAL) as an artifact for review
+    - trivy fs --config ci/.trivy.yaml --severity HIGH,CRITICAL --exit-code 0 --format json --output trivy-code-report.json ./services/
+  artifacts:
+    paths:
+      - trivy-code-report.json
+    expire_in: 1 week
+    when: always
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# =============================================================================
+# STAGE 3: AIKIDO SOURCE SCAN — early fail-fast gate (main only)
+# =============================================================================
+# Scans source code for security issues BEFORE building Docker images.
+# Aikido covers: SAST (code vulnerabilities), SCA (dependency CVEs),
+# secrets detection, IaC misconfigurations, and license compliance.
+#
+# Purpose: Fail-fast gate — catches security issues BEFORE wasting CI minutes
+# building Docker images (~4 min) and running integration tests (~5 min).
+# If this stage fails, Stages 4-7 are skipped, saving ~10 min of CI time.
+#
+# Note: This is NOT redundant with Stage 6b (Aikido release gate). Stage 3
+# is a point-in-time source scan. Stage 6b registers the release for
+# CONTINUOUS MONITORING and can also scan the built container images.
+#
+# Decision: Runs on main only to conserve Aikido API scan quota.
+# Feature branches get Trivy code scan (free, fast, offline) instead.
+#
+# Prerequisites:
+#   - AIKIDO_CLIENT_API_KEY set in GitLab CI/CD variables (masked, ALL branches)
+#   - Generate token at: https://app.aikido.dev → CI/CD settings
+
+aikido-source-scan:
+  stage: security:code
+  image: node:22
+  before_script: []  # Override default — Node job, not Python
+  script:
+    - npm install --global @aikidosec/ci-api-client
+    - |
+      aikido-api-client scan-release \
+        "$CI_PROJECT_ID" \
+        "$CI_COMMIT_SHA" \
+        --apikey "$AIKIDO_CLIENT_API_KEY" \
+        --fail-on-sast-scan \
+        --fail-on-iac-scan \
+        --fail-on-secrets-scan
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 4: BUILD — Docker image builds (main only)
+# =============================================================================
+# Builds all 10 service images using Docker-in-Docker.
+# Images are tagged with the commit SHA for traceability and :latest for convenience.
+# Pushed to the container registry for the integration and scan stages.
+#
+# Decision: Only runs on main to save CI minutes. Feature branch code is
+# validated by unit tests + Trivy code scan + SonarQube; images are only
+# built for code that has passed review and been merged.
+# Integration tests now depend on this stage (pre-built image strategy).
+
+build-images:
+  stage: build
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script: []  # Override default — Docker job, not Python
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin
+
+    # Build all service images — context is ./services (matches docker-compose.yml)
+    - |
+      for SERVICE in \
+        nginx \
+        auth-service \
+        user-db-access-service \
+        customer-db-access-service \
+        job-db-access-service \
+        user-bl-service \
+        job-bl-service \
+        customer-bl-service \
+        admin-bl-service \
+        frontend; do
+
+        echo "========================================="
+        echo "Building: $SERVICE"
+        echo "========================================="
+
+        docker build \
+          -f services/$SERVICE/Dockerfile \
+          -t "$IMAGE_TAG/$SERVICE:$IMAGE_VERSION" \
+          -t "$IMAGE_TAG/$SERVICE:latest" \
+          services/
+
+        docker push "$IMAGE_TAG/$SERVICE:$IMAGE_VERSION"
+        docker push "$IMAGE_TAG/$SERVICE:latest"
+      done
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 6a: TRIVY IMAGE SCAN — scan built Docker images (main only)
+# =============================================================================
+# Scans each Docker image for OS-level vulnerabilities (e.g., openssl, libc)
+# and application-layer issues that only appear in the final built image.
+#
+# Decision: Runs in parallel with the Aikido release gate (6b) for defence
+# in depth — Trivy and Aikido use different vulnerability databases, so
+# together they catch more issues than either alone.
+
+trivy-image-scan:
+  stage: scan:image
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_CERT_PATH: "/certs/client"
+    DOCKER_TLS_VERIFY: "1"
+  before_script: []
+  script:
+    - |
+      SCAN_FAILED=0
+      for SERVICE in \
+        nginx \
+        auth-service \
+        user-db-access-service \
+        customer-db-access-service \
+        job-db-access-service \
+        user-bl-service \
+        job-bl-service \
+        customer-bl-service \
+        admin-bl-service \
+        frontend; do
+
+        echo "========================================="
+        echo "Scanning image: $SERVICE"
+        echo "========================================="
+
+        # CRITICAL = fail pipeline; HIGH = report only
+        trivy image \
+          --severity CRITICAL \
+          --exit-code 1 \
+          --ignore-unfixed \
+          --format table \
+          "$IMAGE_TAG/$SERVICE:$IMAGE_VERSION" || SCAN_FAILED=1
+
+        # Full report for artifact
+        trivy image \
+          --severity HIGH,CRITICAL \
+          --exit-code 0 \
+          --ignore-unfixed \
+          --format json \
+          --output "trivy-image-${SERVICE}.json" \
+          "$IMAGE_TAG/$SERVICE:$IMAGE_VERSION"
+      done
+
+      if [ "$SCAN_FAILED" -eq 1 ]; then
+        echo "CRITICAL vulnerabilities found in one or more images!"
+        exit 1
+      fi
+  artifacts:
+    paths:
+      - trivy-image-*.json
+    expire_in: 1 week
+    when: always
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 6b: AIKIDO RELEASE GATE — release registration & monitoring (main only)
+# =============================================================================
+# Final security gate before deployment. Runs in parallel with Trivy image scan.
+#
+# This stage does MORE than Stage 3 (source scan). The scan-release command:
+#   1. Re-scans source (SAST, SCA, secrets, IaC) — catches CVEs published
+#      since Stage 3 ran (~10-15 min earlier)
+#   2. Scans built container images — OS-level CVEs (openssl, libc, etc.)
+#      if Aikido is configured with container registry access
+#   3. Registers this commit SHA as a "release" in Aikido's platform for
+#      CONTINUOUS MONITORING — if a new CVE is published next week that
+#      affects this deployed version, Aikido alerts via dashboard/email
+#
+# Decision: Defence in depth — Trivy scans container images (OS-level CVEs,
+# offline DB), Aikido scans application-level security + registers for
+# ongoing monitoring. Different databases, different purposes.
+# Stage 3 = fail-fast before build. Stage 6b = release gate + monitoring.
+
+aikido-release-gate:
+  stage: scan:image
+  image: node:22
+  needs:
+    - build-images
+    - integration-tests
+  before_script: []  # Override default — Node job, not Python
+  script:
+    - npm install --global @aikidosec/ci-api-client
+    - |
+      aikido-api-client scan-release \
+        "$CI_PROJECT_ID" \
+        "$CI_COMMIT_SHA" \
+        --apikey "$AIKIDO_CLIENT_API_KEY" \
+        --fail-on-sast-scan \
+        --fail-on-iac-scan \
+        --fail-on-secrets-scan
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 5: INTEGRATION TESTS — pre-built images via Docker Compose (main only)
+# =============================================================================
+# Spins up the entire application stack (all 11 services + Postgres + Redis)
+# using PRE-BUILT images from the build stage. Tests hit real endpoints
+# through NGINX.
+#
+# Decision: Runs on main only. Feature branches rely on unit tests (80%
+# coverage minimum) + Trivy + SonarQube for fast feedback. Integration tests
+# use pre-built images (via ci/docker-compose.ci-prebuilt.yml) to eliminate
+# the double-build problem — images are built once in the build stage.
+#
+# How pre-built images work:
+#   - docker-compose.yml defines build: directives
+#   - ci/docker-compose.ci-prebuilt.yml adds image: tags pointing to the registry
+#   - `docker compose pull` fetches pre-built images
+#   - `docker compose up` (without --build) uses the pulled images
+#   - Only the integration-runner builds from scratch (not in the registry)
+#
+# Test types:
+#   1. Pairwise — tests specific service pairs (e.g., job-bl ↔ job-db-access)
+#   2. E2E Smoke — full business path through ALL layers
+
+integration-tests:
+  stage: integration
+  image: docker:24
+  needs:
+    - build-images
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_CERT_PATH: "/certs/client"
+    DOCKER_TLS_VERIFY: "1"
+  before_script: []
+  script:
+    # Install docker compose plugin
+    - apk add --no-cache docker-compose || true
+
+    # Authenticate to the container registry
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin
+
+    # Pull all pre-built service images from the registry
+    - >
+      IMAGE_TAG="$IMAGE_TAG" IMAGE_VERSION="$IMAGE_VERSION"
+      docker compose
+      -f docker-compose.yml
+      -f ci/docker-compose.ci.yml
+      -f ci/docker-compose.ci-prebuilt.yml
+      pull
+
+    # Build only the integration-runner (not in registry)
+    - >
+      docker compose
+      -f docker-compose.yml
+      -f ci/docker-compose.ci.yml
+      -f ci/docker-compose.ci-prebuilt.yml
+      build integration-runner
+
+    # Start the stack using pre-built images (no --build flag!).
+    # The integration-runner's depends_on (condition: service_healthy) ensures
+    # all services are healthy before tests start.
+    - >
+      docker compose
+      -f docker-compose.yml
+      -f ci/docker-compose.ci.yml
+      -f ci/docker-compose.ci-prebuilt.yml
+      up
+      --exit-code-from integration-runner
+
+  after_script:
+    # Copy JUnit XML from the integration-runner container for GitLab test reporting
+    - docker cp crm_integration_runner:/tests/results/integration-junit.xml ./integration-junit.xml || true
+    # Always collect logs for debugging, even on failure
+    - docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml -f ci/docker-compose.ci-prebuilt.yml logs --tail=100 > integration-logs.txt 2>&1 || true
+    - docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml -f ci/docker-compose.ci-prebuilt.yml down -v || true
+  artifacts:
+    paths:
+      - integration-logs.txt
+      - integration-junit.xml
+    reports:
+      junit: integration-junit.xml
+    expire_in: 3 days
+    when: always
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 6: DEPLOY — push images & trigger deployment repo (main only)
+# =============================================================================
+# After all tests and scans pass, trigger the deployment repository pipeline.
+# This stage uses a manual gate — a human must click "play" to deploy.
+#
+# Decision: Manual gate on deploy because this pushes to the deployment repo
+# at gitlab.comp.dkit.ie/finalproject/Prototypes/yr4-projectdeploymentrepo.
+# Automatic deployment to prod is risky for a microservices app with 11 services.
+
+trigger-deploy:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - trivy-image-scan
+    - aikido-release-gate
+    - integration-tests
+  before_script: []
+  script:
+    - apk add --no-cache curl
+    # Trigger the deployment repo pipeline, passing the image tag
+    - >
+      curl --fail --request POST
+      --form "token=${DEPLOY_REPO_TRIGGER_TOKEN}"
+      --form "ref=main"
+      --form "variables[IMAGE_TAG]=${IMAGE_TAG}"
+      --form "variables[IMAGE_VERSION]=${IMAGE_VERSION}"
+      --form "variables[SOURCE_COMMIT]=${CI_COMMIT_SHA}"
+      --form "variables[SOURCE_BRANCH]=${CI_COMMIT_BRANCH}"
+      "${DEPLOY_REPO_TRIGGER_URL}"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+      allow_failure: false

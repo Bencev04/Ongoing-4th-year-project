@@ -1,0 +1,73 @@
+# SonarQube Docker Compose — Code Quality Analysis
+#
+# Usage:
+#   docker compose -f ci/docker-compose.sonarqube.yml up -d
+#   Open http://localhost:9000 (default admin/admin)
+#
+# Purpose:
+#   Self-hosted SonarQube Community Edition for static analysis,
+#   code smell detection, duplication tracking, and coverage reporting.
+#   Runs separately from the application stack — dev tooling only.
+#
+# Setup:
+#   1. Start:  docker compose -f ci/docker-compose.sonarqube.yml up -d
+#   2. Wait ~60s for SonarQube to initialise
+#   3. Open http://localhost:9000, log in as admin/admin
+#   4. Create a project: "crm-calendar-microservices"
+#   5. Generate a token: Administration → Security → Tokens
+#   6. Store token as SONAR_TOKEN in GitLab CI/CD variables
+#   7. Run analysis: sonar-scanner -Dproject.settings=ci/sonar-project.properties
+
+services:
+  sonarqube:
+    image: sonarqube:10-community
+    container_name: crm_sonarqube
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://sonarqube-db:5432/sonarqube
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: sonar
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_extensions:/opt/sonarqube/extensions
+      - sonarqube_logs:/opt/sonarqube/logs
+    depends_on:
+      sonarqube-db:
+        condition: service_healthy
+    networks:
+      - sonarqube_network
+
+  sonarqube-db:
+    image: postgres:15-alpine
+    container_name: crm_sonarqube_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: sonar
+      POSTGRES_DB: sonarqube
+    volumes:
+      - sonarqube_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar -d sonarqube"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - sonarqube_network
+
+volumes:
+  sonarqube_data:
+    driver: local
+  sonarqube_extensions:
+    driver: local
+  sonarqube_logs:
+    driver: local
+  sonarqube_pgdata:
+    driver: local
+
+networks:
+  sonarqube_network:
+    driver: bridge

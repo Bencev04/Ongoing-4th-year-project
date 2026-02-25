@@ -1,0 +1,33 @@
+# User Service (Business Logic) Dependencies
+
+# FastAPI and ASGI server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Pydantic and settings
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+email-validator>=2.0.0
+
+# Authentication
+python-jose[cryptography]>=3.4.0
+
+# HTTP client for inter-service communication
+httpx>=0.26.0
+
+# Redis async client for caching
+redis>=5.0.0
+
+# Multipart form support
+python-multipart>=0.0.6
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+pytest-xdist>=3.5.0  # Parallel test execution
+
+# Development
+black>=23.12.0
+isort>=5.13.0
+mypy>=1.8.0

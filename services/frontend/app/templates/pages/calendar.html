@@ -1,0 +1,310 @@
+{% extends "base.html" %}
+
+{% block content %}
+{#
+  Calendar Page - Main monthly view with header, grid, and status legend
+
+  Features:
+  - Month navigation (previous/today/next)
+  - View switcher (Month/Week/Day) - UI placeholder for future implementation
+  - Job creation modal
+  - Drag-and-drop job rescheduling
+  - HTMX-powered partial updates for smooth navigation
+  - Alpine.js for client-side interactivity
+
+  Template Variables:
+  - year, month: Currently displayed month
+  - month_name: Full month name (e.g., "February")
+  - prev_year, prev_month: Previous month coordinates
+  - next_year, next_month: Next month coordinates
+  - calendar_days: 42-cell calendar grid data
+  - weekdays: Mon-Sun header labels
+#}
+<div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6"
+     x-data="calendarApp()"
+     x-init="init()">
+
+    <!-- ── Calendar Header ──────────────────────────────────────────── -->
+    <div class="flex items-center justify-between mb-6">
+        <div class="flex items-center space-x-4">
+
+            <!-- Month Navigation (prev / today / next) -->
+            <div class="flex items-center space-x-2">
+                <!-- Previous Month -->
+                <button hx-get="/calendar/grid?year={{ prev_year }}&month={{ prev_month }}"
+                        hx-target="#calendar-grid"
+                        hx-swap="innerHTML"
+                        hx-push-url="/calendar?year={{ prev_year }}&month={{ prev_month }}"
+                        class="p-2 rounded-md hover:bg-gray-100 transition-colors"
+                        aria-label="Previous month">
+                    <svg class="h-5 w-5 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+                    </svg>
+                </button>
+
+                <!-- Today — always jumps to the real current month -->
+                <button hx-get="/calendar/grid"
+                        hx-target="#calendar-grid"
+                        hx-swap="innerHTML"
+                        hx-push-url="/calendar"
+                        class="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50">
+                    Today
+                </button>
+
+                <!-- Next Month -->
+                <button hx-get="/calendar/grid?year={{ next_year }}&month={{ next_month }}"
+                        hx-target="#calendar-grid"
+                        hx-swap="innerHTML"
+                        hx-push-url="/calendar?year={{ next_year }}&month={{ next_month }}"
+                        class="p-2 rounded-md hover:bg-gray-100 transition-colors"
+                        aria-label="Next month">
+                    <svg class="h-5 w-5 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Current Month / Year Display -->
+            <h1 class="text-2xl font-bold text-gray-900">
+                {{ month_name }} {{ year }}
+            </h1>
+        </div>
+
+        <div class="flex items-center space-x-4">
+            <!-- View Switcher (Month / Week / Day) -->
+            <div class="flex rounded-md shadow-sm" role="group" aria-label="Calendar view">
+                <button type="button"
+                        class="px-4 py-2 text-sm font-medium text-gray-900 bg-white border border-gray-200 rounded-l-lg hover:bg-gray-100 hover:text-teal-600">
+                    Month
+                </button>
+                <button type="button"
+                        class="px-4 py-2 text-sm font-medium text-gray-500 bg-white border-t border-b border-gray-200 hover:bg-gray-100 hover:text-teal-600">
+                    Week
+                </button>
+                <button type="button"
+                        class="px-4 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-200 rounded-r-lg hover:bg-gray-100 hover:text-teal-600">
+                    Day
+                </button>
+            </div>
+
+            <!-- New Job — HTMX-only (no conflicting Alpine @click) -->
+            <button hx-get="/calendar/job-modal"
+                    hx-target="#modal-container"
+                    hx-swap="innerHTML"
+                    class="inline-flex items-center px-4 py-2 bg-orange-500 text-white text-sm font-medium rounded-md hover:bg-orange-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-400 transition-colors">
+                <svg class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                </svg>
+                New Job
+            </button>
+        </div>
+    </div>
+
+    <!-- ── Calendar Grid (swapped via HTMX on navigation) ───────────── -->
+    <div id="calendar-grid" class="bg-white rounded-lg shadow overflow-hidden">
+        {% include "partials/calendar_grid.html" %}
+    </div>
+
+    <!-- ── Status Legend ─────────────────────────────────────────────── -->
+    <div class="mt-4 flex items-center space-x-6 text-sm text-gray-600">
+        <span class="font-medium">Status:</span>
+        <div class="flex items-center">
+            <span class="w-3 h-3 rounded-full bg-yellow-200 mr-2"></span>
+            Pending
+        </div>
+        <div class="flex items-center">
+            <span class="w-3 h-3 rounded-full bg-blue-200 mr-2"></span>
+            Scheduled
+        </div>
+        <div class="flex items-center">
+            <span class="w-3 h-3 rounded-full bg-green-200 mr-2"></span>
+            In Progress
+        </div>
+        <div class="flex items-center">
+            <span class="w-3 h-3 rounded-full bg-gray-200 mr-2"></span>
+            Completed
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    /**
+     * calendarApp — Alpine.js component for the month-view calendar.
+     *
+     * Responsibilities:
+     *   • Fetch job events for the visible month via authFetch().
+     *   • Track the currently selected date.
+     *   • Support drag-and-drop rescheduling of job cards.
+     *
+     * @returns {object} Alpine.js reactive data + methods.
+     */
+    function calendarApp() {
+        return {
+            /* ── Reactive state ─────────────────────────────────────── */
+
+            /** @type {string|null} Currently selected date (YYYY-MM-DD). */
+            selectedDate: null,
+
+            /** @type {number|null} ID of the job being dragged. */
+            draggedJob: null,
+
+            /* ── Lifecycle ─────────────────────────────────────────── */
+
+            /**
+             * Called once when the component mounts.
+             * Redirects superadmin to the admin portal (no tenant context).
+             * Triggers the initial event fetch for this month.
+             */
+            init() {
+                // Superadmin has no tenant — redirect to admin portal
+                if (typeof getUserRole === 'function' && getUserRole() === 'superadmin') {
+                    window.location.href = '/admin';
+                    return;
+                }
+                console.log('Calendar initialized');
+                this.loadEvents();
+            },
+
+            /* ── Data fetching ─────────────────────────────────────── */
+
+            /**
+             * Fetch calendar events from the job service for the current
+             * month. Uses the last day of the month (calculated from a
+             * Date object) so February, short months, etc. are correct.
+             *
+             * Relies on the global authFetch() helper (defined in
+             * base.html) which injects the Bearer token and handles
+             * silent token refresh on 401.
+             *
+             * @throws {Error} If the API request fails or returns invalid data.
+             */
+            async loadEvents() {
+                try {
+                    /* Template-injected context values. */
+                    const year  = {{ year }};
+                    const month = {{ month }};
+
+                    /* Guard: skip if the Jinja context was not provided. */
+                    if (!year || !month) {
+                        console.warn('Calendar context missing — skipping event fetch.');
+                        return;
+                    }
+
+                    /* Compute the real last day of this month.
+                       new Date(y, m, 0) returns the last day of month m. */
+                    const lastDay = new Date(year, month, 0).getDate();
+
+                    const mm       = String(month).padStart(2, '0');
+                    const startStr = `${year}-${mm}-01`;
+                    const endStr   = `${year}-${mm}-${String(lastDay).padStart(2, '0')}`;
+
+                    const response = await authFetch(
+                        `/api/jobs/calendar?start_date=${startStr}&end_date=${endStr}`
+                    );
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        console.log('Loaded events:', data);
+                        // TODO(job-integration): Overlay events onto calendar grid cells
+                        // This requires matching events by date and updating the DOM
+                    } else if (response.status === 401) {
+                        console.warn('Not authenticated — redirecting to login.');
+                        // Authentication is handled by authFetch() middleware
+                    } else {
+                        const errorMsg = `Failed to load calendar events: ${response.status} ${response.statusText}`;
+                        console.error(errorMsg);
+                        // Display error to user if notification system is available
+                        if (window.showNotification) {
+                            window.showNotification('error', 'Unable to load calendar events. Please try again.');
+                        }
+                    }
+                } catch (error) {
+                    console.error('Failed to load events:', error);
+                    // Display generic error message to user
+                    if (window.showNotification) {
+                        window.showNotification('error', 'An error occurred while loading calendar events.');
+                    }
+                }
+            },
+
+            /* ── UI actions ────────────────────────────────────────── */
+
+            /**
+             * Open the job-create / job-edit modal.
+             *
+             * @param {string|null}  [date=null]  — Pre-fill scheduled date.
+             * @param {number|null}  [jobId=null] — Job ID when editing.
+             */
+            openJobModal(date = null, jobId = null) {
+                console.log('Opening job modal', { date, jobId });
+            },
+
+            /**
+             * Mark a day cell as selected.
+             *
+             * @param {string} date — Date string (YYYY-MM-DD).
+             */
+            selectDay(date) {
+                this.selectedDate = date;
+                console.log('Selected date:', date);
+            },
+
+            /* ── Drag-and-drop ─────────────────────────────────────── */
+
+            /**
+             * Begin dragging a job card.
+             *
+             * @param {DragEvent} event — Native drag event.
+             * @param {number}    jobId — ID of the job being moved.
+             */
+            handleDragStart(event, jobId) {
+                this.draggedJob = jobId;
+                event.dataTransfer.setData('text/plain', String(jobId));
+                event.dataTransfer.effectAllowed = 'move';
+            },
+
+            /**
+             * Handle a job card being dropped on a calendar day.
+             * Sends a PATCH request to update the job's scheduled date.
+             *
+             * @param {DragEvent} event — Native drop event.
+             * @param {string}    date  — Target date (YYYY-MM-DD).
+             */
+            async handleDrop(event, date) {
+                event.preventDefault();
+                const jobId = event.dataTransfer.getData('text/plain');
+
+                if (jobId) {
+                    console.log(`Moving job ${jobId} to ${date}`);
+                    // TODO(job-integration): Send PATCH request to /api/jobs/{jobId}
+                    // Update scheduled_date field and refresh calendar grid
+                    try {
+                        // const response = await authFetch(`/api/jobs/${jobId}`, {
+                        //     method: 'PATCH',
+                        //     headers: { 'Content-Type': 'application/json' },
+                        //     body: JSON.stringify({ scheduled_date: date })
+                        // });
+                        // if (response.ok) await this.loadEvents();
+                    } catch (error) {
+                        console.error('Failed to reschedule job:', error);
+                    }
+                }
+
+                this.draggedJob = null;
+            },
+
+            /**
+             * Allow the day cell to accept a drop.
+             *
+             * @param {DragEvent} event — Native dragover event.
+             */
+            handleDragOver(event) {
+                event.preventDefault();
+                event.dataTransfer.dropEffect = 'move';
+            }
+        };
+    }
+</script>
+{% endblock %}
