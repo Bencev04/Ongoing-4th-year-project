@@ -1,0 +1,22 @@
+{#
+  Calendar Container Partial — Header + Grid (HTMX swap target)
+
+  Renders the shared header (navigation, view-switcher, New Job)
+  plus the month grid.  Swapped into #calendar-container by HTMX.
+
+  Template Variables:
+  - year, month, day: Currently displayed date context
+  - month_name: Full month name (e.g. "March")
+  - heading_text: Display string for the header (e.g. "March 2026")
+  - nav_prev_url, nav_next_url, nav_today_url: HTMX navigation URLs
+  - current_view: "month"
+  - calendar_days: 42-cell calendar grid data
+  - weekdays: Mon-Sun header labels
+#}
+
+{% include "partials/calendar_header.html" %}
+
+<!-- Calendar Grid -->
+<div id="calendar-grid" class="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-1 flex flex-col min-h-0">
+    {% include "partials/calendar_grid.html" %}
+</div>

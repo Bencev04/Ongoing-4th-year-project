@@ -1,0 +1,84 @@
+# =============================================================================
+# Git Ignore
+# =============================================================================
+
+# Python bytecode & caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.pytest_cache/
+test-results/
+
+# IDE / editor files
+.vscode/launch.json
+.playwright-mcp/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment variables (secrets!)
+.env
+.env.local
+.env.production
+
+# Docker overrides (machine-specific local changes)
+docker-compose*.local.yml
+compose*.local.yml
+
+# Local Docker build helper configs (may contain registry credentials)
+build-config*.local.json
+
+# SonarQube scanner working directory
+.scannerwork/
+
+# Trivy cache
+.trivy-cache/
+
+# Ruff linter cache
+.ruff_cache/
+
+# mypy cache
+.mypy_cache/
+
+# Bandit / Gitleaks report artifacts (generated locally or in CI)
+bandit-report.json
+gitleaks-report.json
+ruff-report.json
+trivy-*.json
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# CI-copied seed file (baked into migration-runner image during CI builds)
+services/migration-runner/seed-demo-data.sql
+
+# Logs
+*.log
+
+# Database files (local dev)
+*.sqlite3
+*.db

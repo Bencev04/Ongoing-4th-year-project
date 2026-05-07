@@ -1,0 +1,152 @@
+# =============================================================================
+# pyproject.toml — Centralised tool configuration for the CRM Calendar project
+# =============================================================================
+#
+# This file replaces per-service .flake8, .isort.cfg, and setup.cfg files.
+# All Python tooling (Ruff, Bandit, mypy) is configured here in one place.
+#
+# Ruff replaces black (formatting) + isort (import sorting) + flake8 (linting)
+# in a single tool that runs ~100x faster than the individual tools combined.
+#
+# Usage:
+#   ruff check services/             # Lint all service code
+#   ruff check --fix services/       # Auto-fix fixable violations
+#   ruff format services/            # Format all service code
+#   ruff format --check services/    # Check formatting without changing files
+#   for target in services/*/app services/shared/common; do
+#     [ -d "$target" ] && mypy "$target" --ignore-missing-imports
+#   done
+#   bandit -r services/ -c pyproject.toml  # Run security linting
+
+# =============================================================================
+# RUFF — Linter + Formatter (replaces black + isort + flake8)
+# =============================================================================
+# Docs: https://docs.astral.sh/ruff/
+
+[tool.ruff]
+# Target Python 3.11 to match all service Dockerfiles (FROM python:3.11-slim)
+target-version = "py311"
+
+# Match black's default line length (88 characters)
+line-length = 88
+
+# Scan all service source code including the shared module
+src = ["services"]
+
+# Exclude generated files, caches, and non-Python directories
+extend-exclude = [
+    "__pycache__",
+    ".pytest_cache",
+    "htmlcov",
+    ".scannerwork",
+    "*.egg-info",
+    "node_modules",
+    ".venv",
+]
+
+[tool.ruff.lint]
+# Rule sets enabled:
+#   E   — pycodestyle errors (basic Python style violations)
+#   F   — pyflakes (unused imports, undefined names, etc.)
+#   I   — isort (import ordering — replaces standalone isort)
+#   B   — flake8-bugbear (common Python pitfalls and design problems)
+#   UP  — pyupgrade (modernise syntax for Python 3.11+)
+#   S   — flake8-bandit (security rules — subset of Bandit integrated into Ruff)
+select = ["E", "F", "I", "B", "UP", "S"]
+
+# Ignore rules that conflict with the project's existing patterns:
+#   E501 — line too long (handled by the formatter, not the linter)
+#   E402 — module import not at top of file (FastAPI route files sometimes
+#          need late imports after function definitions or constants)
+#   S101 — use of assert (needed in test files for pytest assertions)
+#   S104 — binding to 0.0.0.0 (required for Docker container services)
+#   S105 — possible hardcoded password (too many false positives with pydantic Field defaults)
+#   S106 — possible hardcoded password in function argument (same reason)
+#   B904 — raise-without-from-inside-except (52 existing error handlers would
+#          need manual refactoring; low risk, tracked for future cleanup)
+ignore = ["E501", "E402", "S104", "S105", "S106", "B904"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files may use assert statements, hardcoded test credentials,
+# and other patterns that would trigger security linting rules
+"**/tests/**/*.py" = ["S101", "S105", "S106", "S107", "S108"]
+"**/test_*.py" = ["S101", "S105", "S106", "S107", "S108"]
+"conftest.py" = ["S101", "S105", "S106", "S107"]
+# Seed/init scripts may contain hardcoded demo credentials
+"scripts/*.sql" = ["S105", "S106"]
+# FastAPI route files use Depends() in function defaults — this is the
+# standard FastAPI dependency injection pattern, NOT a code smell.
+# B008 (function-call-in-default-argument) is a false positive here.
+"**/api/**/*.py" = ["B008"]
+"**/routes/**/*.py" = ["B008"]
+"**/routes.py" = ["B008"]
+# Shared auth module uses Depends() for FastAPI dependency injection
+"**/shared/**/*.py" = ["B008"]
+
+[tool.ruff.lint.isort]
+# Match the import style documented in AGENTS.md:
+# Standard library → Third-party → Local application
+known-first-party = ["app", "common"]
+known-third-party = ["fastapi", "sqlalchemy", "pydantic", "httpx", "redis"]
+
+[tool.ruff.format]
+# Match black's default formatting style (the project previously used black)
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# =============================================================================
+# BANDIT — Python security linter
+# =============================================================================
+# Docs: https://bandit.readthedocs.io/
+#
+# Bandit performs deeper Python-specific security analysis than Ruff's S rules.
+# It catches patterns like:
+#   - SQL injection via string formatting
+#   - Use of eval/exec
+#   - Insecure use of subprocess
+#   - Weak cryptographic algorithms
+#   - Hardcoded passwords and secrets
+
+[tool.bandit]
+# Scan all Python service code
+targets = ["services"]
+
+# Exclude test directories — test code intentionally uses patterns
+# (like hardcoded credentials) that would trigger security warnings
+exclude_dirs = [
+    "tests",
+    "app/tests",
+    "**/tests",
+    "__pycache__",
+    ".venv",
+]
+
+# Only report HIGH and CRITICAL severity issues to avoid noise
+# LOW/MEDIUM issues are often false positives in web frameworks
+severity = "high"
+confidence = "medium"
+
+# =============================================================================
+# MYPY — Static type checker
+# =============================================================================
+# Docs: https://mypy.readthedocs.io/
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+# Relaxed mode — the codebase is not fully type-annotated yet.
+# ignore_missing_imports allows gradual adoption without blocking CI.
+ignore_missing_imports = true
+
+# =============================================================================
+# PYTEST — Test framework configuration
+# =============================================================================
+# Note: Per-service pytest.ini files still exist for service-specific settings.
+# This section provides project-wide defaults.
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "app/tests"]

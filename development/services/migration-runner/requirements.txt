@@ -1,0 +1,16 @@
+# Migration Runner Dependencies
+# Only this container needs the synchronous PostgreSQL driver for Alembic.
+# asyncpg is included because common/database.py eagerly creates the async
+# engine at import time (required for model registration on Base.metadata).
+alembic>=1.13
+psycopg2-binary>=2.9
+sqlalchemy>=2.0
+asyncpg>=0.29
+pydantic-settings>=2.0
+pydantic>=2.0
+python-dotenv>=1.0
+# Structured logging and metrics
+python-json-logger>=2.0.0
+
+# Prometheus metrics
+prometheus-client>=0.19.0

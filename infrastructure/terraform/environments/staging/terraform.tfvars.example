@@ -1,0 +1,27 @@
+# Example staging Terraform variables.
+# Copy to terraform.tfvars locally and adjust values. Do not commit real tfvars files.
+
+aws_region  = "eu-west-1"
+project_name = "yr4-project"
+environment  = "staging"
+vpc_cidr     = "10.10.0.0/16"
+
+kubernetes_version = "1.30"
+
+node_instance_type = "t3.medium"
+node_desired_size  = 2
+node_min_size      = 1
+node_max_size      = 3
+
+rds_instance_class    = "db.t3.micro"
+rds_allocated_storage = 20
+rds_db_name           = "crm_calendar_staging"
+
+redis_node_type = "cache.t3.micro"
+enabled         = true
+
+# Optional: add IAM principal ARNs for EKS admin access.
+additional_eks_admin_principal_arns = []
+
+# Use AWS Secrets Manager values created by the infrastructure layer.
+use_existing_infra_secrets = true

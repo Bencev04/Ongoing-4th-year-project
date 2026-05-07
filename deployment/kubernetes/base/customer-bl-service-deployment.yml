@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-bl-service
+  labels:
+    app: customer-bl-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: customer-bl-service
+  template:
+    metadata:
+      labels:
+        app: customer-bl-service
+    spec:
+      serviceAccountName: customer-bl-service-sa
+      containers:
+      - name: customer-bl-service
+        image: bencev04/4th-year-proj-tadgh-bence:customer-bl-service-latest
+        ports:
+        - containerPort: 8007
+          name: http
+          protocol: TCP
+        envFrom:
+        - secretRef:
+            name: app-secrets
+        - configMapRef:
+            name: app-config
+        env:
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: redis-credentials
+              key: CUSTOMER_BL_REDIS_URL
+        - name: CUSTOMER_SERVICE_URL
+          value: "http://customer-db-access-service"
+        - name: JOB_SERVICE_URL
+          value: "http://job-db-access-service"
+        - name: AUTH_SERVICE_URL
+          value: "http://auth-service"
+        - name: MAPS_SERVICE_URL
+          value: "http://maps-access-service"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/v1/health
+            port: 8007
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/v1/ready
+            port: 8007
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 10

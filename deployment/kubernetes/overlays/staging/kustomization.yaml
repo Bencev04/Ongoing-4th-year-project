@@ -1,0 +1,117 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: year4-project-staging
+
+# Reference the base configuration
+resources:
+  - ../../base
+  - external-secrets.yaml
+  - migration-job.yaml
+
+# Staging-specific configuration
+labels:
+  - pairs:
+      app.kubernetes.io/name: year4-project
+      app.kubernetes.io/version: "cf553e6f"
+      environment: staging
+      managed-by: kustomize
+
+commonAnnotations:
+  environment: staging
+  deployment.type: staging
+  description: "Staging deployment with balanced configuration"
+  cloudwatch.aws.amazon.com/auto-annotate-dotnet: "false"
+  cloudwatch.aws.amazon.com/auto-annotate-java: "false"
+  cloudwatch.aws.amazon.com/auto-annotate-nodejs: "false"
+  cloudwatch.aws.amazon.com/auto-annotate-python: "false"
+  instrumentation.opentelemetry.io/inject-dotnet: "false"
+  instrumentation.opentelemetry.io/inject-java: "false"
+  instrumentation.opentelemetry.io/inject-nodejs: "false"
+  instrumentation.opentelemetry.io/inject-python: "false"
+
+# Staging uses 1 replica — keep rollout pressure low on the observability-enabled node group
+replicas:
+  - name: auth-service
+    count: 1
+  - name: user-bl-service
+    count: 1
+  - name: user-db-access-service
+    count: 1
+  - name: job-bl-service-deployment
+    count: 1
+  - name: job-db-access-service-deployment
+    count: 1
+  - name: customer-bl-service
+    count: 1
+  - name: customer-db-access-service
+    count: 1
+  - name: admin-bl-service
+    count: 1
+  - name: maps-access-service
+    count: 1
+  - name: notification-service
+    count: 1
+  - name: frontend-deployment
+    count: 1
+  - name: nginx-gateway
+    count: 1
+
+# Service type patch - use LoadBalancer for staging (cloud access)
+# Ingress resource excluded — staging uses nginx-gateway LoadBalancer directly
+# Recreate strategy — avoids 2x pods during rollout on small staging cluster
+patches:
+  - path: nginx-service-patch.yaml
+  # Keep staging scheduling predictable on the small node group. This inline
+  # JSON6902 patch is compatible with both standalone kustomize and
+  # kubectl apply -k; do not use a multi-document patch file here.
+  - target:
+      kind: Deployment
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+  - target:
+      kind: Ingress
+      name: api-ingress
+    patch: |
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: api-ingress
+  - target:
+      kind: Deployment
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: unused
+      spec:
+        strategy:
+          type: Recreate
+
+# ── Generated ConfigMaps ────────────────────────────────────────
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: app-config
+    literals:
+      - ENVIRONMENT=staging
+      - LOG_LEVEL=INFO
+      - DEBUG=false
+      - CORS_ORIGINS=*
+  - name: smtp-config
+    literals:
+      - SMTP_HOST=
+      - SMTP_PORT=587
+      - SMTP_FROM_EMAIL=noreply@workflow.staging
+      - SMTP_FROM_NAME=Workflow Platform (Staging)
+      - SMTP_USE_TLS=true

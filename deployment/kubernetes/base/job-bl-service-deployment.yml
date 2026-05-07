@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: job-bl-service-deployment
+  labels:
+    app: job-bl-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: job-bl-service
+  template:
+    metadata:
+      labels:
+        app: job-bl-service
+    spec:
+      serviceAccountName: job-bl-service-sa
+      containers:
+      - name: job-bl-service
+        image: bencev04/4th-year-proj-tadgh-bence:job-bl-service-latest
+        ports:
+        - containerPort: 8006
+          name: http
+          protocol: TCP
+        envFrom:
+        - secretRef:
+            name: app-secrets
+        - configMapRef:
+            name: app-config
+        env:
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: redis-credentials
+              key: JOB_BL_REDIS_URL
+        - name: JOB_SERVICE_URL
+          value: "http://job-db-access-service"
+        - name: CUSTOMER_SERVICE_URL
+          value: "http://customer-db-access-service"
+        - name: USER_SERVICE_URL
+          value: "http://user-db-access-service"
+        - name: AUTH_SERVICE_URL
+          value: "http://auth-service"
+        - name: MAPS_SERVICE_URL
+          value: "http://maps-access-service"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/v1/health
+            port: 8006
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/v1/ready
+            port: 8006
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 10

@@ -1,0 +1,186 @@
+{#
+  Calendar Grid Partial — Monthly View (Spanning Bars)
+
+  HTMX-swappable partial that renders the monthly calendar grid.
+  Multi-day events visually SPAN across day cells (like Google Calendar)
+  using percentage-based absolute positioning within each week row.
+
+  Template Variables:
+  ─────────────────
+  weekdays        : list[str]   — Weekday labels (Mon → Sun).
+  calendar_weeks  : list[dict]  — 6 week rows, each containing:
+      .cells      : list[dict]  — 7 day cells, each with:
+          .date             : date
+          .day              : int
+          .is_current_month : bool
+          .is_today         : bool
+          .single_events    : list — Non-spanning events for this cell.
+          .events           : list — All events (including multi-day).
+      .segments   : list[dict]  — Multi-day spanning bar descriptors:
+          .event            : dict — The original event dict.
+          .start_col        : int  — 0-based column index where bar starts.
+          .span             : int  — Number of columns the bar spans.
+          .is_start         : bool — True if this is the event's real start.
+          .is_end           : bool — True if this is the event's real end.
+          .lane             : int  — Vertical lane index (0-based).
+      .max_lanes  : int         — Number of spanning bar lanes in this row.
+  year            : int
+  month           : int
+#}
+
+<!-- ── Weekday Headers ──────────────────────────────────────────────── -->
+<div class="grid grid-cols-7 bg-gray-50/80 border-b border-gray-200">
+    {% for day_name in weekdays %}
+    <div class="px-4 py-2.5 text-center text-xs font-bold uppercase tracking-wider
+                {% if loop.index > 5 %}text-gray-400{% else %}text-gray-500{% endif %}">
+        {{ day_name }}
+    </div>
+    {% endfor %}
+</div>
+
+<!-- ── Calendar Weeks (6 rows) ──────────────────────────────────────── -->
+<div class="flex flex-col flex-1">
+    {% for week in calendar_weeks %}
+    <div class="flex-1 min-h-0 flex flex-col relative border-b border-gray-100 last:border-b-0">
+
+        {# ── Row 1: Date numbers ────────────────────────────────────── #}
+        <div class="grid grid-cols-7">
+            {% for cell in week.cells %}
+            <div class="calendar-day border-r border-gray-100 px-1 pt-0.5 pb-0
+                        {% if not cell.is_current_month %}bg-gray-50/60 text-gray-400{% endif %}
+                        {% if cell.is_today %}bg-blue-50/70 ring-1 ring-inset ring-primary-400/40{% endif %}
+                        {% if loop.index0 % 7 >= 5 and not cell.is_today %}bg-gray-50/30{% endif %}
+                        hover:bg-gray-50 transition-colors cursor-pointer"
+                 @dragover.prevent="handleDragOver($event)"
+                 @drop="handleDrop($event, '{{ cell.date.strftime('%Y-%m-%d') }}')"
+                 hx-get="/calendar/day/{{ cell.date.strftime('%Y-%m-%d') }}"
+                 hx-target="#modal-container"
+                 hx-trigger="dblclick">
+                <div class="flex items-center justify-between">
+                    <span class="text-xs font-medium leading-none
+                                {% if cell.is_today %}
+                                    text-white bg-primary-600 rounded-full w-6 h-6 flex items-center justify-center shadow-sm
+                                {% elif not cell.is_current_month %}
+                                    text-gray-400
+                                {% else %}
+                                    text-gray-700
+                                {% endif %}">
+                        {{ cell.day }}
+                    </span>
+
+                    {% set total_count = cell.single_events|length %}
+                    {% if total_count > 0 %}
+                    <span class="text-[10px] font-medium text-gray-400 whitespace-nowrap">
+                        {{ total_count }}
+                    </span>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        {# ── Row 2: Multi-day spanning bars ─────────────────────────── #}
+        {% if week.segments %}
+        <div class="relative" style="height: {{ week.max_lanes * 1.375 }}rem;">
+            {# Transparent click targets behind spanning bars for full-cell dblclick #}
+            <div class="grid grid-cols-7 absolute inset-0" style="z-index: 0;">
+                {% for cell in week.cells %}
+                <div class="cursor-pointer"
+                     hx-get="/calendar/day/{{ cell.date.strftime('%Y-%m-%d') }}"
+                     hx-target="#modal-container"
+                     hx-trigger="dblclick"
+                     @dragover.prevent="handleDragOver($event)"
+                     @drop="handleDrop($event, '{{ cell.date.strftime('%Y-%m-%d') }}')"></div>
+                {% endfor %}
+            </div>
+            {% for seg in week.segments %}
+            <div class="event-multiday absolute text-xs cursor-pointer px-1.5 py-0.5
+                        flex items-center justify-center text-center
+                        {% if seg.is_start and seg.is_end %}rounded
+                        {% elif seg.is_start %}rounded-l
+                        {% elif seg.is_end %}rounded-r
+                        {% else %}rounded-none{% endif %}
+                        {% if seg.status == 'pending' %}status-pending
+                        {% elif seg.status == 'scheduled' %}status-scheduled
+                        {% elif seg.status == 'in_progress' %}status-in_progress
+                        {% elif seg.status == 'completed' %}status-completed
+                        {% else %}status-cancelled{% endif %}"
+                 style="left: calc({{ seg.start_col }} / 7 * 100%);
+                        width: calc({{ seg.span }} / 7 * 100%);
+                        top: {{ seg.lane * 1.375 }}rem;
+                        height: 1.25rem;
+                        {% if seg.color %}background-color: {{ seg.color }}25; border-left: 3px solid {{ seg.color }};{% endif %}"
+                 hx-get="/calendar/job-modal?job_id={{ seg.id }}"
+                 hx-target="#modal-container"
+                 hx-trigger="click"
+                 @click.stop
+                 @dblclick.stop
+                 draggable="true"
+                 @dragstart="handleDragStart($event, {{ seg.id }})"
+                 @dragend="handleDragEnd($event)"
+                 title="{{ seg.title }}{% if seg.start_time %} ({{ seg.start_time }} – {{ seg.end_time }}){% endif %}">
+                <span class="block w-full truncate">
+                    {% if seg.is_start and seg.start_time %}
+                        <span class="font-semibold">{{ seg.start_time }}</span>
+                        {{ seg.title }}
+                    {% elif seg.is_start %}
+                        {{ seg.title }}
+                    {% else %}
+                        <span class="opacity-60">{{ seg.title }}</span>
+                    {% endif %}
+                </span>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        {# ── Row 3: Single-day events ───────────────────────────────── #}
+        <div class="grid grid-cols-7 flex-1 min-h-0">
+            {% for cell in week.cells %}
+            <div class="calendar-day-events border-r border-gray-100 px-1 pb-0.5 overflow-y-auto cursor-pointer
+                        {% if not cell.is_current_month %}bg-gray-50/60{% endif %}
+                        {% if cell.is_today %}bg-blue-50/70{% endif %}
+                        {% if loop.index0 % 7 >= 5 and not cell.is_today %}bg-gray-50/30{% endif %}"
+                 style="flex: 1 1 0; min-height: 0;"
+                 hx-get="/calendar/day/{{ cell.date.strftime('%Y-%m-%d') }}"
+                 hx-target="#modal-container"
+                 hx-trigger="dblclick"
+                 @dragover.prevent="handleDragOver($event)"
+                 @drop="handleDrop($event, '{{ cell.date.strftime('%Y-%m-%d') }}')">
+                <div class="space-y-px">
+                    {% for event in cell.single_events %}
+                    <div class="event-chip text-[10px] leading-tight px-1 py-px rounded truncate cursor-pointer
+                                priority-{{ event.priority }}
+                                {% if event.status == 'pending' %}status-pending
+                                {% elif event.status == 'scheduled' %}status-scheduled
+                                {% elif event.status == 'in_progress' %}status-in_progress
+                                {% elif event.status == 'completed' %}status-completed
+                                {% else %}status-cancelled{% endif %}"
+                         {% if event.color %}style="border-left: 3px solid {{ event.color }};"{% endif %}
+                         draggable="true"
+                         @dragstart="handleDragStart($event, {{ event.id }})"
+                         @dragend="handleDragEnd($event)"
+                         hx-get="/calendar/job-modal?job_id={{ event.id }}"
+                         hx-target="#modal-container"
+                         hx-trigger="click"
+                         @click.stop
+                         @dblclick.stop
+                         title="{{ event.title }}{% if event.start_time %} ({{ event.start_time }}){% endif %}">
+                        {% if event.start_time %}
+                        <span class="font-medium">{{ event.start_time }}</span>
+                        {% endif %}
+                        {{ event.title }}
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+{# Hidden inputs — navigation state consumed by Alpine refreshCalendar() #}
+<input type="hidden" id="current-year" value="{{ year }}">
+<input type="hidden" id="current-month" value="{{ month }}">
+<input type="hidden" id="current-view" value="month">

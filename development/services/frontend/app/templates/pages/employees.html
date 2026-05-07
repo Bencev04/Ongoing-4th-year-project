@@ -1,0 +1,572 @@
+{% extends "base.html" %}
+
+{# ==========================================================================
+   Employees Page
+   --------------------------------------------------------------------------
+   Renders the main employee management view with:
+   • Search bar
+   • Paginated employee table
+   • Invite / Add employee modal
+   • Employee detail side-panel
+   ========================================================================== #}
+
+{% block head %}
+<style>
+    /* Slide-over animation for employee detail panel */
+    .slide-enter { animation: slideIn 0.25s ease-out; }
+    .slide-leave { animation: slideOut 0.2s ease-in; }
+    @keyframes slideIn  { from { transform: translateX(100%); } to { transform: translateX(0); } }
+    @keyframes slideOut { from { transform: translateX(0); }    to { transform: translateX(100%); } }
+
+    /* Highlight row on hover for better UX */
+    .employee-row { transition: background-color 0.15s ease; }
+    .employee-row:hover { background-color: #f9fafb; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6"
+     x-data="employeesApp()"
+     x-init="init()">
+
+    {# ---- Page Header ---- #}
+    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
+        <div>
+            <h1 class="text-2xl font-bold text-gray-900">Employees</h1>
+            <p class="mt-1 text-sm text-gray-500">
+                Manage your team members and their roles.
+            </p>
+        </div>
+
+        <!-- Add Employee button (gated by employees.create permission) -->
+        <button x-show="$store.permissions.canCreateEmployee" x-cloak
+                @click="openInviteModal()"
+                class="inline-flex items-center px-4 py-2 bg-teal-500 text-white text-sm font-medium rounded-md hover:bg-teal-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-400 transition-colors">
+            <svg class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+            </svg>
+            Add Employee
+        </button>
+    </div>
+
+    {# ---- Search Bar ---- #}
+    <div class="bg-white rounded-lg shadow p-4 mb-6">
+        <div class="flex flex-col sm:flex-row gap-4">
+        <div class="relative flex-1">
+            <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                <svg class="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+            </div>
+            <input type="text"
+                   x-model.debounce.300ms="search"
+                   @input="debouncedSearch()"
+                   placeholder="Search by name, email, position or skills..."
+                   class="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md
+                          text-sm placeholder-gray-400
+                          focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+        </div>
+        </div>
+    </div>
+
+    {# ---- Loading Indicator ---- #}
+    <div x-show="loading" class="text-center py-12">
+        <svg class="animate-spin h-8 w-8 text-primary-600 mx-auto" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+        <p class="mt-2 text-sm text-gray-500">Loading employees…</p>
+    </div>
+
+    {# ---- Error Alert ---- #}
+    <div x-show="error" x-cloak
+         class="rounded-md bg-red-50 p-4 mb-6">
+        <div class="flex">
+            <svg class="h-5 w-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                      d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <p class="ml-3 text-sm text-red-700" x-text="error"></p>
+        </div>
+    </div>
+
+    {# ---- Empty State ---- #}
+    <div x-show="!loading && !error && employees.length === 0" x-cloak
+         class="text-center py-12 bg-white rounded-lg shadow">
+        <svg class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg>
+        <h3 class="mt-2 text-sm font-medium text-gray-900">No employees found</h3>
+        <p class="mt-1 text-sm text-gray-500">
+            <span x-show="search">No results for "<span x-text="search"></span>".</span>
+            <span x-show="!search">Get started by adding your first employee.</span>
+        </p>
+    </div>
+
+    {# ---- Employees Table ---- #}
+    <div x-show="!loading && employees.length > 0" x-cloak
+         class="bg-white shadow overflow-hidden sm:rounded-lg">
+        <table class="min-w-full divide-y divide-gray-200">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Position</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Skills</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Hourly Rate</th>
+                    <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                </tr>
+            </thead>
+            <tbody class="bg-white divide-y divide-gray-200">
+                <template x-for="emp in employees" :key="emp.id">
+                    <tr class="employee-row cursor-pointer" @click="viewEmployee(emp.id)">
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <div class="flex items-center">
+                                <div class="h-8 w-8 rounded-full bg-primary-100 flex items-center justify-center">
+                                    <span class="text-sm font-medium text-primary-700"
+                                          x-text="(emp.first_name?.[0] || '') + (emp.last_name?.[0] || '')"></span>
+                                </div>
+                                <div class="ml-4">
+                                    <div class="text-sm font-medium text-gray-900"
+                                         x-text="(emp.first_name || '') + ' ' + (emp.last_name || '')"></div>
+                                    <div class="text-sm text-gray-500" x-text="emp.email || ''"></div>
+                                </div>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="emp.position || '—'"></td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="emp.skills || '—'"></td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            <span x-show="emp.hourly_rate != null" x-text="'€' + Number(emp.hourly_rate).toFixed(2)"></span>
+                            <span x-show="emp.hourly_rate == null">—</span>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium" @click.stop>
+                                <button x-show="$store.permissions.canEditEmployee"
+                                    @click="openEditModal(emp.id)"
+                                    title="Edit employee"
+                                    class="text-primary-600 hover:text-primary-900 mr-3">
+                                <svg class="h-4 w-4 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                          d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                                </svg>
+                                Edit
+                            </button>
+                                <button x-show="$store.permissions.canDeleteEmployee"
+                                    @click="confirmDelete(emp.id, (emp.first_name || '') + ' ' + (emp.last_name || ''))"
+                                    title="Delete employee"
+                                    class="text-red-600 hover:text-red-900">
+                                <svg class="h-4 w-4 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                          d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                </svg>
+                                Delete
+                            </button>
+                        </td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+
+        <!-- Pagination -->
+        <div class="bg-white px-4 py-3 flex items-center justify-between border-t border-gray-200 sm:px-6">
+            <div class="flex-1 flex justify-between sm:hidden">
+                <button @click="goToPage(currentPage - 1)" :disabled="currentPage <= 1"
+                        class="relative inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium
+                               rounded-md text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">
+                    Previous
+                </button>
+                <button @click="goToPage(currentPage + 1)" :disabled="currentPage >= totalPages"
+                        class="ml-3 relative inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium
+                               rounded-md text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">
+                    Next
+                </button>
+            </div>
+            <div class="hidden sm:flex-1 sm:flex sm:items-center sm:justify-between">
+                <div>
+                    <p class="text-sm text-gray-700">
+                        Showing
+                        <span class="font-medium" x-text="total === 0 ? 0 : ((currentPage - 1) * perPage) + 1"></span>
+                        to
+                        <span class="font-medium" x-text="Math.min(currentPage * perPage, total)"></span>
+                        of
+                        <span class="font-medium" x-text="total"></span>
+                        results
+                    </p>
+                </div>
+                <div>
+                    <nav class="relative z-0 inline-flex rounded-md shadow-sm -space-x-px" aria-label="Pagination">
+                        <button @click="goToPage(currentPage - 1)" :disabled="currentPage <= 1"
+                                class="relative inline-flex items-center px-2 py-2 rounded-l-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">
+                            <span class="sr-only">Previous</span>
+                            <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+                            </svg>
+                        </button>
+
+                        <template x-for="page in visiblePages" :key="page">
+                            <button @click="goToPage(page)"
+                                    :class="page === currentPage ? 'z-10 bg-teal-50 border-teal-500 text-teal-600' : 'bg-white border-gray-300 text-gray-500 hover:bg-gray-50'"
+                                    class="relative inline-flex items-center px-4 py-2 border text-sm font-medium"
+                                    x-text="page">
+                            </button>
+                        </template>
+
+                        <button @click="goToPage(currentPage + 1)" :disabled="currentPage >= totalPages"
+                                class="relative inline-flex items-center px-2 py-2 rounded-r-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">
+                            <span class="sr-only">Next</span>
+                            <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                            </svg>
+                        </button>
+                    </nav>
+                </div>
+            </div>
+        </div>
+    </div>
+    {# ---- Toast notification ---- #}
+    <div x-show="toast.show" x-cloak
+         x-transition:enter="transition ease-out duration-300"
+         x-transition:enter-start="opacity-0 translate-y-2"
+         x-transition:enter-end="opacity-100 translate-y-0"
+         x-transition:leave="transition ease-in duration-200"
+         x-transition:leave-start="opacity-100 translate-y-0"
+         x-transition:leave-end="opacity-0 translate-y-2"
+         class="fixed bottom-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg text-white text-sm font-medium"
+         :class="toast.type === 'success' ? 'bg-green-500' : 'bg-red-500'"
+         x-text="toast.message">
+    </div>
+
+    {# ---- Create / Edit Employee Modal ---- #}
+    <div x-show="modalOpen" x-cloak class="fixed inset-0 z-50" @keydown.escape.window="closeModal()">
+
+        <!-- Backdrop -->
+        <div x-show="modalOpen"
+             x-transition:enter="transition-opacity ease-out duration-300"
+             x-transition:enter-start="opacity-0" x-transition:enter-end="opacity-100"
+             x-transition:leave="transition-opacity ease-in duration-200"
+             x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0"
+             @click="closeModal()"
+             class="fixed inset-0 bg-black bg-opacity-40"></div>
+
+        <!-- Dialog -->
+        <div class="fixed inset-0 flex items-center justify-center p-4">
+            <div x-show="modalOpen"
+                 x-transition:enter="transition ease-out duration-300"
+                 x-transition:enter-start="opacity-0 scale-95" x-transition:enter-end="opacity-100 scale-100"
+                 x-transition:leave="transition ease-in duration-200"
+                 x-transition:leave-start="opacity-100 scale-100" x-transition:leave-end="opacity-0 scale-95"
+                 @click.stop
+                 class="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+
+                {# Header #}
+                <div class="px-6 py-4 border-b flex justify-between items-center">
+                    <h2 class="text-lg font-semibold text-gray-900"
+                        x-text="editingEmployeeId ? 'Edit Employee' : 'Add Employee'"></h2>
+                    <button @click="closeModal()" class="text-gray-400 hover:text-gray-600">
+                        <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+
+                {# Form #}
+                <form @submit.prevent="saveEmployee()" class="px-6 py-4 space-y-4">
+
+                    {# Error banner #}
+                    <div x-show="formError" x-cloak class="rounded-md bg-red-50 p-3">
+                        <p class="text-sm text-red-700" x-text="formError"></p>
+                    </div>
+
+                    {# ── Edit mode: show employee name context ── #}
+                    <div x-show="editingEmployeeId" class="rounded-md bg-gray-50 p-3">
+                        <p class="text-sm text-gray-600">
+                            Editing <strong x-text="form.first_name + ' ' + form.last_name"></strong>
+                            <span class="text-gray-400" x-text="form.email ? '(' + form.email + ')' : ''"></span>
+                        </p>
+                    </div>
+
+                    {# ── Create-only fields (name, email, password, phone) ── #}
+                    <template x-if="!editingEmployeeId">
+                        <div class="space-y-4">
+                            {# Name row #}
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">First Name <span class="text-red-500">*</span></label>
+                                    <input type="text" x-model="form.first_name" required
+                                           class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Last Name <span class="text-red-500">*</span></label>
+                                    <input type="text" x-model="form.last_name" required
+                                           class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                                </div>
+                            </div>
+
+                            {# Email #}
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Email <span class="text-red-500">*</span></label>
+                                <input type="email" x-model="form.email" required
+                                       class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                            </div>
+
+                            {# Password #}
+                            <div x-data="{ show: false }">
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Password <span class="text-red-500">*</span></label>
+                                <div class="relative">
+                                    <input :type="show ? 'text' : 'password'" x-model="form.password" required minlength="8"
+                                           placeholder="Minimum 8 characters" autocomplete="new-password"
+                                           class="w-full border border-gray-300 rounded-md px-3 py-2 pr-10 text-sm focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                                    <button type="button" @click="show = !show"
+                                            class="absolute inset-y-0 right-0 z-10 flex items-center pr-3 text-gray-500 hover:text-gray-700">
+                                        <svg x-show="!show" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                                        <svg x-show="show" x-cloak class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M3.98 8.223A10.477 10.477 0 001.934 12c1.292 4.338 5.31 7.5 10.066 7.5.993 0 1.953-.138 2.863-.395M6.228 6.228A10.45 10.45 0 0112 4.5c4.756 0 8.773 3.162 10.065 7.498a10.522 10.522 0 01-4.293 5.774M6.228 6.228L3 3m3.228 3.228l3.65 3.65m7.894 7.894L21 21m-3.228-3.228l-3.65-3.65m0 0a3 3 0 10-4.243-4.243m4.242 4.242L9.88 9.88" /></svg>
+                                    </button>
+                                </div>
+                            </div>
+
+                            {# Phone #}
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Phone</label>
+                                <input type="tel" x-model="form.phone"
+                                       class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                            </div>
+                        </div>
+                    </template>
+
+                    {# ── Shared fields (position, hourly rate, skills) ── #}
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Position</label>
+                            <input type="text" x-model="form.position"
+                                   class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Hourly Rate (€)</label>
+                            <input type="number" x-model="form.hourly_rate" min="0" step="0.01"
+                                   class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                        </div>
+                    </div>
+
+                    {# Skills #}
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Skills</label>
+                        <input type="text" x-model="form.skills" placeholder="e.g. Plumbing, Electrical"
+                               class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                    </div>
+
+                    {# Notes (edit mode only) #}
+                    <div x-show="editingEmployeeId">
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Notes</label>
+                        <textarea x-model="form.notes" rows="3" placeholder="Internal notes about this employee…"
+                                  class="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500"></textarea>
+                    </div>
+
+                    {# Buttons #}
+                    <div class="flex justify-end space-x-3 pt-2 border-t">
+                        <button type="button" @click="closeModal()"
+                                class="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50">
+                            Cancel
+                        </button>
+                        <button type="submit" :disabled="saving"
+                                class="px-4 py-2 text-sm font-medium text-white bg-teal-500 rounded-md hover:bg-teal-600 disabled:opacity-50 disabled:cursor-not-allowed">
+                            <span x-show="!saving" x-text="editingEmployeeId ? 'Update' : 'Add Employee'"></span>
+                            <span x-show="saving">Saving…</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    {# ---- Employee Detail Slide-Over ---- #}
+    <div x-show="detailOpen" x-cloak
+         class="fixed inset-0 z-40"
+         @keydown.escape.window="closeDetail()">
+
+        <!-- Backdrop -->
+        <div x-show="detailOpen"
+             x-transition:enter="transition-opacity ease-out duration-300"
+             x-transition:enter-start="opacity-0"
+             x-transition:enter-end="opacity-100"
+             x-transition:leave="transition-opacity ease-in duration-200"
+             x-transition:leave-start="opacity-100"
+             x-transition:leave-end="opacity-0"
+             @click="closeDetail()"
+             class="fixed inset-0 bg-black bg-opacity-25 mt-16">
+        </div>
+
+        <!-- Panel -->
+        <div x-show="detailOpen"
+             x-transition:enter="transition ease-out duration-300"
+             x-transition:enter-start="translate-x-full"
+             x-transition:enter-end="translate-x-0"
+             x-transition:leave="transition ease-in duration-200"
+             x-transition:leave-start="translate-x-0"
+             x-transition:leave-end="translate-x-full"
+             class="fixed inset-y-0 right-0 w-full sm:w-96 bg-white shadow-xl mt-16 overflow-y-auto">
+
+            {# Panel header #}
+            <div class="px-4 py-4 border-b bg-gray-50 flex justify-between items-center sticky top-0 z-10">
+                <h2 class="text-lg font-semibold text-gray-900">Employee Details</h2>
+                <button @click="closeDetail()" class="text-gray-400 hover:text-gray-600">
+                    <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+
+            {# Loading state #}
+            <div x-show="detailLoading" class="p-6 text-center">
+                <svg class="animate-spin h-8 w-8 text-teal-500 mx-auto" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor"
+                          d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+            </div>
+
+            {# Detail content #}
+            <div x-show="!detailLoading && selectedEmployee" class="p-6 space-y-6">
+
+                {# Avatar + name #}
+                <div class="flex items-center space-x-4">
+                    <div class="h-14 w-14 rounded-full bg-teal-100 flex items-center justify-center">
+                        <span class="text-lg font-semibold text-teal-700"
+                              x-text="(selectedEmployee?.first_name?.[0] || '') + (selectedEmployee?.last_name?.[0] || '')"></span>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-gray-900"
+                            x-text="(selectedEmployee?.first_name || '') + ' ' + (selectedEmployee?.last_name || '')"></h3>
+                        <p class="text-sm text-gray-500" x-text="selectedEmployee?.position || 'No position set'"></p>
+                    </div>
+                </div>
+
+                {# Info fields #}
+                <dl class="divide-y divide-gray-200">
+                    <div class="py-3 flex justify-between text-sm">
+                        <dt class="text-gray-500">Email</dt>
+                        <dd class="text-gray-900">
+                            <a :href="'mailto:' + (selectedEmployee?.email || '')"
+                               class="text-teal-600 hover:text-teal-500"
+                               x-text="selectedEmployee?.email || '—'"></a>
+                        </dd>
+                    </div>
+                    <div class="py-3 flex justify-between text-sm">
+                        <dt class="text-gray-500">Position</dt>
+                        <dd class="text-gray-900" x-text="selectedEmployee?.position || '—'"></dd>
+                    </div>
+                    <div class="py-3 flex justify-between text-sm">
+                        <dt class="text-gray-500">Hourly Rate</dt>
+                        <dd class="text-gray-900">
+                            <span x-show="selectedEmployee?.hourly_rate != null"
+                                  x-text="'€' + Number(selectedEmployee?.hourly_rate).toFixed(2)"></span>
+                            <span x-show="selectedEmployee?.hourly_rate == null">—</span>
+                        </dd>
+                    </div>
+                    <div class="py-3 flex justify-between text-sm">
+                        <dt class="text-gray-500">Skills</dt>
+                        <dd class="text-gray-900 text-right max-w-[200px]" x-text="selectedEmployee?.skills || '—'"></dd>
+                    </div>
+                    <div class="py-3 flex justify-between text-sm" x-show="selectedEmployee?.notes">
+                        <dt class="text-gray-500">Notes</dt>
+                        <dd class="text-gray-900 text-right max-w-[200px]" x-text="selectedEmployee?.notes"></dd>
+                    </div>
+                    <div class="py-3 flex justify-between text-sm" x-show="selectedEmployee?.created_at">
+                        <dt class="text-gray-500">Added</dt>
+                        <dd class="text-gray-900"
+                            x-text="selectedEmployee?.created_at ? new Date(selectedEmployee.created_at).toLocaleDateString() : ''"></dd>
+                    </div>
+                </dl>
+
+                {# Action buttons #}
+                <div class="flex space-x-3 pt-4 border-t border-gray-200">
+                        <button x-show="$store.permissions.canEditEmployee"
+                            @click="openEditModal(selectedEmployee?.id)"
+                            class="flex-1 inline-flex justify-center items-center px-4 py-2 border border-gray-300
+                                   rounded-md text-sm font-medium text-gray-700 bg-white hover:bg-gray-50
+                                   transition-colors">
+                        <svg class="h-4 w-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                        Edit
+                    </button>
+                        <button x-show="$store.permissions.canDeleteEmployee"
+                            @click="confirmDelete(selectedEmployee?.id, (selectedEmployee?.first_name || '') + ' ' + (selectedEmployee?.last_name || ''))"
+                            class="flex-1 inline-flex justify-center items-center px-4 py-2 border border-red-300
+                                   rounded-md text-sm font-medium text-red-700 bg-white hover:bg-red-50
+                                   transition-colors">
+                        <svg class="h-4 w-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                        Delete
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    {# ---- Delete Confirmation Modal ---- #}
+    <div x-show="deleteModalOpen" x-cloak
+         class="fixed inset-0 z-50 overflow-y-auto"
+         @keydown.escape.window="deleteModalOpen = false">
+
+        <!-- Backdrop -->
+        <div x-show="deleteModalOpen"
+             x-transition:enter="transition-opacity ease-out duration-300"
+             x-transition:enter-start="opacity-0" x-transition:enter-end="opacity-100"
+             x-transition:leave="transition-opacity ease-in duration-200"
+             x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0"
+             @click="deleteModalOpen = false"
+             class="fixed inset-0 bg-black bg-opacity-50"></div>
+
+        <!-- Dialog -->
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div x-show="deleteModalOpen"
+                 x-transition:enter="transition ease-out duration-300"
+                 x-transition:enter-start="opacity-0 scale-95" x-transition:enter-end="opacity-100 scale-100"
+                 x-transition:leave="transition ease-in duration-200"
+                 x-transition:leave-start="opacity-100 scale-100" x-transition:leave-end="opacity-0 scale-95"
+                 @click.stop
+                 class="relative bg-white rounded-lg shadow-xl w-full max-w-md p-6">
+
+                <div class="flex items-start">
+                    <div class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-red-100">
+                        <svg class="h-6 w-6 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                        </svg>
+                    </div>
+                    <div class="ml-4">
+                        <h3 class="text-lg font-medium text-gray-900">Delete Employee</h3>
+                        <p class="mt-2 text-sm text-gray-500">
+                            Are you sure you want to delete
+                            <strong x-text="deletingEmployeeName"></strong>?
+                            This will deactivate their user account.
+                        </p>
+                    </div>
+                </div>
+
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button @click="deleteModalOpen = false"
+                            class="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300
+                                   rounded-md hover:bg-gray-50">
+                        Cancel
+                    </button>
+                    <button @click="deleteEmployee()"
+                            :disabled="deleting"
+                            class="px-4 py-2 text-sm font-medium text-white bg-red-600 border border-transparent
+                                   rounded-md hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed">
+                        <span x-show="!deleting">Delete</span>
+                        <span x-show="deleting">Deleting…</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}{% endblock %}

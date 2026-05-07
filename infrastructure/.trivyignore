@@ -1,0 +1,46 @@
+# =============================================================================
+# Trivy Ignore File — Suppress known acceptable findings
+# =============================================================================
+# Trivy is a security scanner that checks Terraform files for misconfigurations.
+# Some findings are expected for a college project with cost constraints.
+# Add check IDs here to suppress them (one per line).
+#
+# FORMAT:   AVD-AWS-XXXX
+# DOCS:     https://avd.aquasec.com/misconfig/
+# =============================================================================
+
+# We intentionally use single-AZ RDS (no Multi-AZ) to save ~50% cost.
+# In production you'd want Multi-AZ for automatic failover.
+AVD-AWS-0080
+
+# ElastiCache transit encryption is disabled intentionally.
+# All traffic stays within the private VPC, so TLS adds overhead without benefit.
+AVD-AWS-0051
+
+# RDS deletion protection is disabled so terraform destroy works.
+# In real production, you'd enable this.
+AVD-AWS-0177
+
+# EKS public endpoint access is enabled (so we can run kubectl from our laptops).
+# In production, you'd restrict this to specific IP ranges.
+AVD-AWS-0041
+
+# RDS not using IAM auth — we use username/password (simpler for college project).
+AVD-AWS-0176
+
+# EKS public endpoint access is enabled (so we can run kubectl from our laptops).
+# In production, you'd restrict to specific IP ranges or use a VPN.
+AVD-AWS-0040
+
+# Unrestricted egress (0.0.0.0/0) on security groups for EKS, RDS, and ElastiCache.
+# Nodes need outbound access to pull container images (ECR/Docker Hub), reach AWS APIs,
+# and communicate with managed services. Restricting egress would break the cluster.
+AVD-AWS-0104
+
+# Public subnets auto-assign public IPs — this is by design.
+# Public subnets host the ALB (internet-facing load balancer), which needs a public IP.
+AVD-AWS-0164
+
+# S3 state bucket uses SSE-S3 (AES256) encryption, not a customer-managed KMS key.
+# CMKs add cost (~$1/month + API charges) with no benefit for a state bucket.
+AVD-AWS-0132

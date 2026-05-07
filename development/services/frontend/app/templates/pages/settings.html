@@ -1,0 +1,840 @@
+{% extends "base.html" %}
+
+{% block content %}
+<!--
+  Settings Page — Tenant Administration
+  ======================================
+    Four-tab layout for owner/admin users to manage their organisation.
+
+  Tabs
+  ----
+  1. Organisation — edit company details (name, address, phone, email, eircode).
+  2. People       — list team members, reset passwords for subordinates.
+    3. Permissions  — toggle fine-grained permission grants per user.
+    4. Audit Logs   — review tenant activity across jobs, customers, and settings.
+
+  Data is loaded client-side by the ``settingsApp()`` Alpine component
+  defined in ``/static/js/settings.js``.
+-->
+<div class="min-h-screen bg-gray-50"
+     x-data="settingsApp()"
+     x-init="init()">
+
+    <!-- ================================================================== -->
+    <!-- Access Denied Banner                                               -->
+    <!-- ================================================================== -->
+    <div x-show="accessDenied" x-cloak class="flex items-center justify-center min-h-[60vh]">
+        <div class="text-center">
+            <svg class="mx-auto h-16 w-16 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                <path stroke-linecap="round" stroke-linejoin="round"
+                      d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+            </svg>
+            <h2 class="mt-4 text-xl font-semibold text-gray-900">Access Denied</h2>
+            <p class="mt-2 text-gray-500">You need owner or admin privileges to access settings.</p>
+            <a href="/calendar"
+               class="mt-6 inline-flex items-center px-4 py-2 bg-teal-500 text-white text-sm font-medium rounded-lg hover:bg-teal-600 transition-colors">
+                ← Back to Calendar
+            </a>
+        </div>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- Main Content (hidden when access is denied)                        -->
+    <!-- ================================================================== -->
+    <div x-show="!accessDenied" x-cloak>
+
+        <!-- ── Page Header ─────────────────────────────────────────────── -->
+        <div class="bg-white border-b border-gray-200">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h1 class="text-2xl font-bold text-gray-900">Settings</h1>
+                        <p class="mt-1 text-sm text-gray-500">Manage your organisation, team, permissions and audit activity</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── Global Messages ─────────────────────────────────────────── -->
+
+        <!-- Success Toast -->
+        <div x-show="successMessage" x-cloak
+             x-transition:enter="transition ease-out duration-300"
+             x-transition:enter-start="opacity-0 -translate-y-2"
+             x-transition:enter-end="opacity-100 translate-y-0"
+             x-transition:leave="transition ease-in duration-200"
+             x-transition:leave-start="opacity-100"
+             x-transition:leave-end="opacity-0"
+             class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-4">
+            <div class="rounded-lg bg-green-50 p-4 border border-green-200">
+                <div class="flex items-center">
+                    <svg class="h-5 w-5 text-green-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <p class="ml-3 text-sm font-medium text-green-700" x-text="successMessage"></p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Error Toast -->
+        <div x-show="error" x-cloak
+             class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-4">
+            <div class="rounded-lg bg-red-50 p-4 border border-red-200">
+                <div class="flex items-center">
+                    <svg class="h-5 w-5 text-red-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <p class="ml-3 text-sm font-medium text-red-700" x-text="error"></p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── Tab Navigation ──────────────────────────────────────────── -->
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6">
+            <div class="border-b border-gray-200">
+                <nav class="-mb-px flex space-x-8" aria-label="Settings tabs">
+
+                    <!-- Organisation Tab -->
+                    <button @click="activeTab = 'organisation'; loadCompany()"
+                            :class="activeTab === 'organisation'
+                                ? 'border-teal-500 text-teal-600'
+                                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition-colors">
+                        <svg class="h-4 w-4 inline-block mr-1.5 -mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                  d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>
+                        </svg>
+                        Organisation
+                    </button>
+
+                    <!-- People Tab -->
+                    <button @click="activeTab = 'people'; loadPeople()"
+                            :class="activeTab === 'people'
+                                ? 'border-teal-500 text-teal-600'
+                                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition-colors">
+                        <svg class="h-4 w-4 inline-block mr-1.5 -mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                  d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>
+                        </svg>
+                        People
+                    </button>
+
+                    <!-- Permissions Tab -->
+                    <button @click="activeTab = 'permissions'; loadPermissionsTab()"
+                            :class="activeTab === 'permissions'
+                                ? 'border-teal-500 text-teal-600'
+                                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition-colors">
+                        <svg class="h-4 w-4 inline-block mr-1.5 -mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                  d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+                        </svg>
+                        Permissions
+                    </button>
+
+                    <!-- Audit Logs Tab -->
+                    <button @click="activeTab = 'audit'; loadAuditLogs()"
+                            :class="activeTab === 'audit'
+                                ? 'border-teal-500 text-teal-600'
+                                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition-colors">
+                        <svg class="h-4 w-4 inline-block mr-1.5 -mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                  d="M9 17v-6m3 6V7m3 10v-3m3 7H6a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                        </svg>
+                        Audit Logs
+                    </button>
+
+                    <!-- Notifications Tab -->
+                    <button @click="activeTab = 'notifications'; loadNotificationPrefs()"
+                            :class="activeTab === 'notifications'
+                                ? 'border-teal-500 text-teal-600'
+                                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition-colors">
+                        <svg class="h-4 w-4 inline-block mr-1.5 -mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                  d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/>
+                        </svg>
+                        Notifications
+                    </button>
+
+                </nav>
+            </div>
+        </div>
+
+        <!-- ── Loading Spinner ─────────────────────────────────────────── -->
+        <div x-show="loading" class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 text-center">
+            <svg class="animate-spin h-10 w-10 text-teal-500 mx-auto" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p class="mt-3 text-sm text-gray-500">Loading…</p>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- TAB 1 — Organisation                                            -->
+        <!-- ================================================================ -->
+        <div x-show="activeTab === 'organisation' && !loading" x-cloak
+             class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+
+            <div class="bg-white shadow rounded-lg">
+                <div class="px-6 py-5 border-b border-gray-200">
+                    <h2 class="text-lg font-semibold text-gray-900">Company Information</h2>
+                    <p class="mt-1 text-sm text-gray-500">Update your company's public details</p>
+                </div>
+
+                <form @submit.prevent="saveCompany()" hx-boost="false" class="px-6 py-5 space-y-5">
+
+                    <!-- Company Name -->
+                    <div>
+                        <label for="company-name" class="block text-sm font-medium text-gray-700">Company Name *</label>
+                        <input type="text" id="company-name"
+                               x-model="companyForm.name"
+                               required maxlength="200"
+                               class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                    </div>
+
+                    <!-- Address -->
+                    <div>
+                        <label for="company-address" class="block text-sm font-medium text-gray-700">Address</label>
+                        <input type="text" id="company-address"
+                               x-model="companyForm.address"
+                               maxlength="500"
+                               class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                        <!-- Phone -->
+                        <div>
+                            <label for="company-phone" class="block text-sm font-medium text-gray-700">Phone</label>
+                            <input type="tel" id="company-phone"
+                                   x-model="companyForm.phone"
+                                   maxlength="20"
+                                   class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                        </div>
+                        <!-- Email -->
+                        <div>
+                            <label for="company-email" class="block text-sm font-medium text-gray-700">Email</label>
+                            <input type="email" id="company-email"
+                                   x-model="companyForm.email"
+                                   maxlength="255"
+                                   class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                        </div>
+                    </div>
+
+                    <!-- Eircode -->
+                    <div class="max-w-xs">
+                        <label for="company-eircode" class="block text-sm font-medium text-gray-700">Eircode</label>
+                        <input type="text" id="company-eircode"
+                               x-model="companyForm.eircode"
+                               maxlength="10"
+                               class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="flex justify-end pt-4 border-t border-gray-200">
+                        <button type="submit"
+                                :disabled="submitting"
+                                :class="submitting ? 'opacity-50 cursor-not-allowed' : 'hover:bg-teal-600'"
+                                class="inline-flex items-center px-4 py-2 bg-teal-500 text-white text-sm font-medium rounded-lg transition-colors">
+                            <span x-show="!submitting">Save Changes</span>
+                            <span x-show="submitting" class="flex items-center">
+                                <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                Saving…
+                            </span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- TAB 2 — People                                                  -->
+        <!-- ================================================================ -->
+        <div x-show="activeTab === 'people' && !loading" x-cloak
+             class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+
+            <!-- Search Bar -->
+            <div class="mb-4 flex items-center justify-between">
+                <div class="relative max-w-sm flex-1">
+                    <input type="text"
+                           x-model="peopleSearch"
+                           placeholder="Search by name or email…"
+                           class="w-full rounded-lg border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 pl-10 pr-4 py-2 text-sm border">
+                    <svg class="absolute left-3 top-2.5 h-4 w-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+                    </svg>
+                </div>
+                <span class="ml-4 text-sm text-gray-500" x-text="filteredPeople.length + ' member' + (filteredPeople.length !== 1 ? 's' : '')"></span>
+            </div>
+
+            <!-- People Table -->
+            <div class="bg-white shadow rounded-lg overflow-hidden">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                        <template x-for="person in filteredPeople" :key="person.id">
+                            <tr class="hover:bg-gray-50 transition-colors">
+                                <!-- User Info -->
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="flex items-center">
+                                        <div class="h-9 w-9 rounded-full flex items-center justify-center text-sm font-bold text-white"
+                                             :class="person.is_active ? 'bg-gradient-to-br from-teal-400 to-teal-600' : 'bg-gray-400'"
+                                             x-text="(person.first_name || person.email || '?')[0].toUpperCase()">
+                                        </div>
+                                        <div class="ml-3">
+                                            <p class="text-sm font-medium text-gray-900"
+                                               x-text="(person.first_name && person.last_name) ? person.first_name + ' ' + person.last_name : person.email"></p>
+                                            <p class="text-xs text-gray-500" x-text="person.email"></p>
+                                        </div>
+                                    </div>
+                                </td>
+                                <!-- Role Badge -->
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium"
+                                          :class="{
+                                              'bg-blue-100 text-blue-800': person.role === 'owner',
+                                              'bg-green-100 text-green-800': person.role === 'admin',
+                                              'bg-yellow-100 text-yellow-800': person.role === 'manager',
+                                              'bg-gray-100 text-gray-800': person.role === 'employee' || person.role === 'viewer'
+                                          }"
+                                          x-text="person.role"></span>
+                                </td>
+                                <!-- Status -->
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium"
+                                          :class="person.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'"
+                                          x-text="person.is_active ? 'Active' : 'Inactive'"></span>
+                                </td>
+                                <!-- Actions -->
+                                <td class="px-6 py-4 whitespace-nowrap text-right">
+                                    <button @click="openResetPasswordModal(person)"
+                                            x-show="person.id != currentUserId"
+                                            class="text-sm text-teal-600 hover:text-teal-800 font-medium transition-colors"
+                                            title="Reset this user's password">
+                                        Reset Password
+                                    </button>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+
+                <!-- Empty State -->
+                <div x-show="filteredPeople.length === 0 && !loading"
+                     class="text-center py-12 text-gray-500">
+                    <svg class="mx-auto h-12 w-12 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                        <path stroke-linecap="round" stroke-linejoin="round"
+                              d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>
+                    </svg>
+                    <p class="mt-3 text-sm">No team members found.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- TAB 3 — Permissions                                             -->
+        <!-- ================================================================ -->
+        <div x-show="activeTab === 'permissions' && !loading" x-cloak
+             class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+
+            <!-- User selector -->
+            <div class="bg-white shadow rounded-lg mb-6">
+                <div class="px-6 py-5 border-b border-gray-200">
+                    <h2 class="text-lg font-semibold text-gray-900">User Permissions</h2>
+                    <p class="mt-1 text-sm text-gray-500">
+                        Select a team member to manage their permissions.
+                        Owner and admin roles bypass permissions automatically.
+                    </p>
+                </div>
+                <div class="px-6 py-4">
+                    <label for="perm-user-select" class="block text-sm font-medium text-gray-700 mb-1">Select User</label>
+                    <select id="perm-user-select"
+                            x-model="selectedPermUserId"
+                            @change="loadUserPermissions()"
+                            class="block w-full max-w-md rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                        <option value="">— Choose a user —</option>
+                        <template x-for="person in permissionEligibleUsers" :key="person.id">
+                            <option :value="person.id"
+                                    x-text="(person.first_name && person.last_name ? person.first_name + ' ' + person.last_name + ' — ' : '') + person.email + ' (' + person.role + ')'">
+                            </option>
+                        </template>
+                    </select>
+
+                    <!-- Info: privileged roles bypass -->
+                    <p x-show="selectedUserIsPrivileged" class="mt-3 text-sm text-amber-600 bg-amber-50 rounded-lg px-3 py-2 border border-amber-200">
+                        <svg class="h-4 w-4 inline-block mr-1 -mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                        This user has the <strong x-text="selectedUserRole"></strong> role — they bypass all permission checks automatically.
+                    </p>
+                </div>
+            </div>
+
+            <!-- Permissions Grid (shown when a user is selected) -->
+            <div x-show="selectedPermUserId && permCatalog.length > 0" x-cloak>
+                <template x-for="category in permCatalog" :key="category.category">
+                    <div class="bg-white shadow rounded-lg mb-4 overflow-hidden">
+                        <!-- Category Header -->
+                        <div class="px-6 py-3 bg-gray-50 border-b border-gray-200">
+                            <h3 class="text-sm font-semibold text-gray-700 uppercase tracking-wider" x-text="category.category"></h3>
+                        </div>
+                        <!-- Permission Rows -->
+                        <div class="divide-y divide-gray-100">
+                            <template x-for="perm in category.permissions" :key="perm.key">
+                                <div class="px-6 py-3 flex items-center justify-between hover:bg-gray-50 transition-colors">
+                                    <div>
+                                        <p class="text-sm font-medium text-gray-900" x-text="perm.label"></p>
+                                        <p class="text-xs text-gray-500" x-text="perm.description"></p>
+                                    </div>
+                                    <!-- Toggle Switch -->
+                                    <button type="button"
+                                            @click="togglePermission(perm.key)"
+                                            :class="userPermissions[perm.key] ? 'bg-teal-500' : 'bg-gray-200'"
+                                            class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2"
+                                            :disabled="selectedUserIsPrivileged"
+                                            :title="selectedUserIsPrivileged ? 'Privileged roles bypass permissions' : (userPermissions[perm.key] ? 'Revoke' : 'Grant')">
+                                        <span :class="userPermissions[perm.key] ? 'translate-x-5' : 'translate-x-0'"
+                                              class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out"></span>
+                                    </button>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+
+                <!-- Save Permissions Button -->
+                <div class="flex justify-end mt-4" x-show="!selectedUserIsPrivileged">
+                    <button @click="savePermissions()"
+                            :disabled="submitting"
+                            :class="submitting ? 'opacity-50 cursor-not-allowed' : 'hover:bg-teal-600'"
+                            class="inline-flex items-center px-4 py-2 bg-teal-500 text-white text-sm font-medium rounded-lg transition-colors">
+                        <span x-show="!submitting">Save Permissions</span>
+                        <span x-show="submitting" class="flex items-center">
+                            <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            Saving…
+                        </span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- No User Selected State -->
+            <div x-show="!selectedPermUserId" class="text-center py-12 text-gray-400">
+                <svg class="mx-auto h-12 w-12" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                    <path stroke-linecap="round" stroke-linejoin="round"
+                          d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+                </svg>
+                <p class="mt-3 text-sm">Choose a team member above to view and manage their permissions.</p>
+            </div>
+        </div>
+
+            <!-- ================================================================ -->
+            <!-- TAB 4 — Audit Logs                                              -->
+            <!-- ================================================================ -->
+            <div x-show="activeTab === 'audit' && !loading" x-cloak
+                 class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+
+                <div class="bg-white shadow rounded-lg mb-6">
+                    <div class="px-6 py-5 border-b border-gray-200">
+                        <h2 class="text-lg font-semibold text-gray-900">Audit Logs</h2>
+                        <p class="mt-1 text-sm text-gray-500">
+                            Review company activity such as job changes, customer changes, permission updates, and other tracked actions.
+                        </p>
+                    </div>
+
+                    <!-- Filters -->
+                    <div class="px-6 py-4 space-y-4">
+                        <!-- Row 1: Search + Date range -->
+                        <div class="grid grid-cols-1 gap-4 lg:grid-cols-6">
+                            <div class="lg:col-span-2">
+                                <label for="audit-search" class="block text-sm font-medium text-gray-700 mb-1">Search</label>
+                                <input id="audit-search"
+                                       type="text"
+                                       x-model="auditSearch"
+                                       @keydown.enter="applyAuditSearch()"
+                                       placeholder="Search actor, action, resource..."
+                                       class="block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                            </div>
+                            <div>
+                                <label for="audit-date-from" class="block text-sm font-medium text-gray-700 mb-1">From</label>
+                                <input id="audit-date-from"
+                                       type="date"
+                                       x-model="auditDateFrom"
+                                       @change="applyAuditSearch()"
+                                       class="block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                            </div>
+                            <div>
+                                <label for="audit-date-to" class="block text-sm font-medium text-gray-700 mb-1">To</label>
+                                <input id="audit-date-to"
+                                       type="date"
+                                       x-model="auditDateTo"
+                                       @change="applyAuditSearch()"
+                                       class="block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                            </div>
+                            <div class="flex items-end gap-2">
+                                <button type="button"
+                                        @click="applyAuditSearch()"
+                                        class="inline-flex items-center rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-600">
+                                    <svg class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" /></svg>
+                                    Search
+                                </button>
+                                <button type="button"
+                                        @click="resetAuditFilters()"
+                                        class="inline-flex items-center rounded-md bg-gray-100 px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-200">
+                                    Reset
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Row 2: Dropdown filters -->
+                        <div class="grid grid-cols-1 gap-4 lg:grid-cols-4">
+                            <div>
+                                <label for="audit-action-filter" class="block text-sm font-medium text-gray-700 mb-1">Action</label>
+                                <select id="audit-action-filter"
+                                        x-model="auditActionFilter"
+                                        class="block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                                    <option value="">All actions</option>
+                                    <template x-for="action in auditActionOptions" :key="action">
+                                        <option :value="action" x-text="action"></option>
+                                    </template>
+                                </select>
+                            </div>
+                            <div>
+                                <label for="audit-resource-filter" class="block text-sm font-medium text-gray-700 mb-1">Resource</label>
+                                <select id="audit-resource-filter"
+                                        x-model="auditResourceFilter"
+                                        class="block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2">
+                                    <option value="">All resources</option>
+                                    <template x-for="resource in auditResourceOptions" :key="resource">
+                                        <option :value="resource" x-text="resource"></option>
+                                    </template>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Loading spinner -->
+                <div x-show="auditLoading" class="flex justify-center py-12">
+                    <svg class="animate-spin h-8 w-8 text-teal-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                </div>
+
+                <div x-show="!auditLoading" class="bg-white shadow rounded-lg overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">When</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actor</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Action</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Resource</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Details</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white divide-y divide-gray-200">
+                                <template x-for="log in filteredAuditLogs" :key="log.id">
+                                    <tr class="align-top hover:bg-gray-50 transition-colors">
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-700" x-text="new Date(log.timestamp).toLocaleString()"></td>
+                                        <td class="px-6 py-4 text-sm text-gray-700">
+                                            <div class="font-medium text-gray-900" x-text="log.actor_email || 'Unknown user'"></div>
+                                            <div class="text-xs text-gray-500" x-text="log.actor_role || 'unknown role'"></div>
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+                                            <span class="inline-flex items-center rounded-full bg-teal-50 px-2.5 py-0.5 text-xs font-medium text-teal-700"
+                                                  x-text="log.action"></span>
+                                        </td>
+                                        <td class="px-6 py-4 text-sm text-gray-700">
+                                            <div class="font-medium" x-text="log.resource_type || 'n/a'"></div>
+                                            <div class="text-xs text-gray-500" x-text="log.resource_id ? 'ID ' + log.resource_id : ''"></div>
+                                        </td>
+                                        <td class="px-6 py-4 text-sm text-gray-700 max-w-md">
+                                            <div x-show="!log.details" class="text-gray-400 italic">No extra details</div>
+                                            <div x-show="log.details"
+                                                 x-text="formatAuditDetails(log.details)"
+                                                 class="whitespace-pre-wrap break-words text-xs text-gray-600"></div>
+                                        </td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Empty state -->
+                    <div x-show="filteredAuditLogs.length === 0 && !auditLoading"
+                         class="text-center py-12 text-gray-500">
+                        <svg class="mx-auto h-12 w-12 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                        <p class="mt-3 text-sm">No audit log entries match the current filters.</p>
+                    </div>
+
+                    <!-- Pagination controls -->
+                    <div x-show="auditTotalPages > 1"
+                         class="flex items-center justify-between border-t border-gray-200 bg-white px-4 py-3 sm:px-6">
+                        <div class="flex flex-1 justify-between sm:hidden">
+                            <button @click="goToAuditPage(auditPage - 1)"
+                                    :disabled="auditPage <= 1"
+                                    :class="auditPage <= 1 ? 'cursor-not-allowed opacity-50' : 'hover:bg-gray-50'"
+                                    class="relative inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700">
+                                Previous
+                            </button>
+                            <button @click="goToAuditPage(auditPage + 1)"
+                                    :disabled="auditPage >= auditTotalPages"
+                                    :class="auditPage >= auditTotalPages ? 'cursor-not-allowed opacity-50' : 'hover:bg-gray-50'"
+                                    class="relative ml-3 inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700">
+                                Next
+                            </button>
+                        </div>
+                        <div class="hidden sm:flex sm:flex-1 sm:items-center sm:justify-between">
+                            <div>
+                                <p class="text-sm text-gray-700">
+                                    Page <span class="font-medium" x-text="auditPage"></span>
+                                    of <span class="font-medium" x-text="auditTotalPages"></span>
+                                    &mdash;
+                                    <span class="font-medium" x-text="auditTotal"></span> total entries
+                                </p>
+                            </div>
+                            <div>
+                                <nav class="isolate inline-flex -space-x-px rounded-md shadow-sm" aria-label="Pagination">
+                                    <button @click="goToAuditPage(auditPage - 1)"
+                                            :disabled="auditPage <= 1"
+                                            :class="auditPage <= 1 ? 'cursor-not-allowed opacity-50' : 'hover:bg-gray-50'"
+                                            class="relative inline-flex items-center rounded-l-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 focus:z-20 focus:outline-offset-0">
+                                        <span class="sr-only">Previous</span>
+                                        <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z" clip-rule="evenodd" /></svg>
+                                    </button>
+                                    <span class="relative inline-flex items-center px-4 py-2 text-sm font-semibold text-gray-900 ring-1 ring-inset ring-gray-300">
+                                        <span x-text="auditPage"></span>
+                                    </span>
+                                    <button @click="goToAuditPage(auditPage + 1)"
+                                            :disabled="auditPage >= auditTotalPages"
+                                            :class="auditPage >= auditTotalPages ? 'cursor-not-allowed opacity-50' : 'hover:bg-gray-50'"
+                                            class="relative inline-flex items-center rounded-r-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 focus:z-20 focus:outline-offset-0">
+                                        <span class="sr-only">Next</span>
+                                        <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8.22 5.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 1 1-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" /></svg>
+                                    </button>
+                                </nav>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- ================================================================ -->
+        <!-- TAB 5 — Notifications                                           -->
+        <!-- ================================================================ -->
+        <div x-show="activeTab === 'notifications' && !loading" x-cloak
+             class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+
+            <div class="bg-white shadow rounded-lg">
+                <div class="px-6 py-5 border-b border-gray-200">
+                    <h2 class="text-lg font-semibold text-gray-900">Notification Preferences</h2>
+                    <p class="mt-1 text-sm text-gray-500">
+                        Configure default notification settings for your organisation.
+                        Individual customer preferences can be overridden on the Customers page.
+                    </p>
+                </div>
+
+                <div class="px-6 py-5 space-y-6">
+
+                    <!-- Reminder Timing -->
+                    <div>
+                        <h3 class="text-sm font-semibold text-gray-900 mb-3">Reminder Timing</h3>
+                        <div class="space-y-3">
+                            <label class="flex items-center space-x-3">
+                                <input type="checkbox" x-model="notifPrefs.reminder_24h"
+                                       @change="saveNotifPrefs()"
+                                       class="rounded border-gray-300 text-teal-500 focus:ring-teal-500">
+                                <div>
+                                    <span class="text-sm text-gray-700">24-hour reminder</span>
+                                    <p class="text-xs text-gray-400">Notify customers 24 hours before their scheduled job</p>
+                                </div>
+                            </label>
+                            <label class="flex items-center space-x-3">
+                                <input type="checkbox" x-model="notifPrefs.reminder_1h"
+                                       @change="saveNotifPrefs()"
+                                       class="rounded border-gray-300 text-teal-500 focus:ring-teal-500">
+                                <div>
+                                    <span class="text-sm text-gray-700">1-hour reminder</span>
+                                    <p class="text-xs text-gray-400">Notify customers 1 hour before their scheduled job</p>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Default Channels -->
+                    <div class="border-t border-gray-200 pt-5">
+                        <h3 class="text-sm font-semibold text-gray-900 mb-3">Default Channels for New Customers</h3>
+                        <p class="text-xs text-gray-500 mb-3">When a new customer is created, these channels will be enabled by default</p>
+                        <div class="space-y-3">
+                            <label class="flex items-center space-x-3">
+                                <input type="checkbox" x-model="notifPrefs.default_whatsapp"
+                                       @change="saveNotifPrefs()"
+                                       class="rounded border-gray-300 text-teal-500 focus:ring-teal-500">
+                                <div>
+                                    <span class="text-sm text-gray-700">WhatsApp</span>
+                                    <p class="text-xs text-gray-400">Requires the customer to have a phone number on file</p>
+                                </div>
+                            </label>
+                            <label class="flex items-center space-x-3">
+                                <input type="checkbox" x-model="notifPrefs.default_email"
+                                       @change="saveNotifPrefs()"
+                                       class="rounded border-gray-300 text-teal-500 focus:ring-teal-500">
+                                <div>
+                                    <span class="text-sm text-gray-700">Email</span>
+                                    <p class="text-xs text-gray-400">Requires the customer to have an email address on file</p>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- On The Way / Completion Notifications -->
+                    <div class="border-t border-gray-200 pt-5">
+                        <h3 class="text-sm font-semibold text-gray-900 mb-3">Additional Notifications</h3>
+                        <div class="space-y-3">
+                            <label class="flex items-center space-x-3">
+                                <input type="checkbox" x-model="notifPrefs.notify_on_the_way"
+                                       @change="saveNotifPrefs()"
+                                       class="rounded border-gray-300 text-teal-500 focus:ring-teal-500">
+                                <div>
+                                    <span class="text-sm text-gray-700">"On The Way" notification</span>
+                                    <p class="text-xs text-gray-400">Notify customers when the technician is en route</p>
+                                </div>
+                            </label>
+                            <label class="flex items-center space-x-3">
+                                <input type="checkbox" x-model="notifPrefs.notify_completed"
+                                       @change="saveNotifPrefs()"
+                                       class="rounded border-gray-300 text-teal-500 focus:ring-teal-500">
+                                <div>
+                                    <span class="text-sm text-gray-700">Job completed notification</span>
+                                    <p class="text-xs text-gray-400">Send a summary when a job is marked as completed</p>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Save status -->
+                    <div x-show="notifPrefsSaved" x-cloak
+                         x-transition:enter="transition ease-out duration-200"
+                         x-transition:enter-start="opacity-0"
+                         x-transition:enter-end="opacity-100"
+                         class="rounded-md bg-green-50 p-3 border border-green-200">
+                        <p class="text-sm text-green-700 flex items-center">
+                            <svg class="h-4 w-4 mr-2 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/>
+                            </svg>
+                            Preferences saved
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div><!-- / main content -->
+
+    <!-- ================================================================== -->
+    <!-- Reset Password Modal                                               -->
+    <!-- ================================================================== -->
+    <div x-show="showResetPasswordModal" x-cloak
+         class="fixed inset-0 z-50 overflow-y-auto" aria-modal="true">
+        <!-- Backdrop -->
+        <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity"
+             @click="showResetPasswordModal = false"></div>
+
+        <!-- Modal Panel -->
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div class="relative bg-white rounded-xl shadow-xl max-w-md w-full p-6"
+                 @click.stop>
+                <h3 class="text-lg font-semibold text-gray-900 mb-1">Reset Password</h3>
+                <p class="text-sm text-gray-500 mb-5">
+                    Set a new password for
+                    <strong x-text="resetPasswordUser?.email || ''"></strong>
+                </p>
+
+                <form @submit.prevent="resetPassword()" hx-boost="false">
+                    <div class="space-y-4">
+                        <!-- New Password -->
+                        <div x-data="{ show: false }">
+                            <label for="reset-new-password" class="block text-sm font-medium text-gray-700">
+                                New Password *
+                            </label>
+                            <div class="relative mt-1">
+                                <input :type="show ? 'text' : 'password'" id="reset-new-password"
+                                       x-model="resetPasswordForm.newPassword"
+                                       required minlength="8"
+                                       class="block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2 pr-10">
+                                <button type="button" @click="show = !show"
+                                        class="absolute inset-y-0 right-0 z-10 flex items-center pr-3 text-gray-500 hover:text-gray-700">
+                                    <svg x-show="!show" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                                    <svg x-show="show" x-cloak class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M3.98 8.223A10.477 10.477 0 001.934 12c1.292 4.338 5.31 7.5 10.066 7.5.993 0 1.953-.138 2.863-.395M6.228 6.228A10.45 10.45 0 0112 4.5c4.756 0 8.773 3.162 10.065 7.498a10.522 10.522 0 01-4.293 5.774M6.228 6.228L3 3m3.228 3.228l3.65 3.65m7.894 7.894L21 21m-3.228-3.228l-3.65-3.65m0 0a3 3 0 10-4.243-4.243m4.242 4.242L9.88 9.88" /></svg>
+                                </button>
+                            </div>
+                            <p class="mt-1 text-xs text-gray-500">Minimum 8 characters</p>
+                        </div>
+                        <!-- Confirm Password -->
+                        <div x-data="{ show: false }">
+                            <label for="reset-confirm-password" class="block text-sm font-medium text-gray-700">
+                                Confirm Password *
+                            </label>
+                            <div class="relative mt-1">
+                                <input :type="show ? 'text' : 'password'" id="reset-confirm-password"
+                                       x-model="resetPasswordForm.confirmPassword"
+                                       required minlength="8"
+                                       class="block w-full rounded-md border-gray-300 shadow-sm focus:border-teal-500 focus:ring-teal-500 sm:text-sm border px-3 py-2 pr-10">
+                                <button type="button" @click="show = !show"
+                                        class="absolute inset-y-0 right-0 z-10 flex items-center pr-3 text-gray-500 hover:text-gray-700">
+                                    <svg x-show="!show" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                                    <svg x-show="show" x-cloak class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M3.98 8.223A10.477 10.477 0 001.934 12c1.292 4.338 5.31 7.5 10.066 7.5.993 0 1.953-.138 2.863-.395M6.228 6.228A10.45 10.45 0 0112 4.5c4.756 0 8.773 3.162 10.065 7.498a10.522 10.522 0 01-4.293 5.774M6.228 6.228L3 3m3.228 3.228l3.65 3.65m7.894 7.894L21 21m-3.228-3.228l-3.65-3.65m0 0a3 3 0 10-4.243-4.243m4.242 4.242L9.88 9.88" /></svg>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Modal Error -->
+                    <div x-show="resetPasswordError" x-cloak
+                         class="mt-3 rounded-md bg-red-50 p-3 text-sm text-red-700"
+                         x-text="resetPasswordError"></div>
+
+                    <!-- Actions -->
+                    <div class="mt-6 flex justify-end space-x-3">
+                        <button type="button"
+                                @click="showResetPasswordModal = false"
+                                class="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors">
+                            Cancel
+                        </button>
+                        <button type="submit"
+                                :disabled="submittingReset"
+                                :class="submittingReset ? 'opacity-50 cursor-not-allowed' : 'hover:bg-teal-600'"
+                                class="px-4 py-2 text-sm font-medium text-white bg-teal-500 rounded-lg transition-colors">
+                            <span x-show="!submittingReset">Reset Password</span>
+                            <span x-show="submittingReset">Resetting…</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+</div>
+{% endblock %}

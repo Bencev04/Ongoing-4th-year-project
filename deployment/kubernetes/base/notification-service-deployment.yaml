@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  labels:
+    app: notification-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: notification-service
+  template:
+    metadata:
+      labels:
+        app: notification-service
+    spec:
+      serviceAccountName: notification-service-sa
+      containers:
+      - name: notification-service
+        image: bencev04/4th-year-proj-tadgh-bence:notification-service-latest
+        ports:
+        - containerPort: 8011
+          name: http
+          protocol: TCP
+        envFrom:
+        - secretRef:
+            name: app-secrets
+        - configMapRef:
+            name: app-config
+        - secretRef:
+            name: smtp-secrets
+        - configMapRef:
+            name: smtp-config
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: DATABASE_URL
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: redis-credentials
+              key: NOTIFICATION_REDIS_URL
+        - name: AUTH_SERVICE_URL
+          value: "http://auth-service"
+        - name: USER_SERVICE_URL
+          value: "http://user-db-access-service"
+        - name: JOB_BL_SERVICE_URL
+          value: "http://job-bl-service"
+        - name: CUSTOMER_BL_SERVICE_URL
+          value: "http://customer-bl-service"
+        - name: ADMIN_BL_SERVICE_URL
+          value: "http://admin-bl-service"
+        - name: NOTIFICATION_ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: NOTIFICATION_ENCRYPTION_KEY
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/v1/health
+            port: 8011
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/v1/ready
+            port: 8011
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 10

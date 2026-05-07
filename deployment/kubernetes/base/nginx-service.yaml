@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-gateway
+  labels:
+    app: nginx-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx-gateway
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  sessionAffinity: None

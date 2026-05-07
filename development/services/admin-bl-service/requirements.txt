@@ -1,0 +1,20 @@
+fastapi>=0.115.0
+uvicorn>=0.27.0
+httpx>=0.27.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-jose[cryptography]>=3.4.0
+cryptography>=46.0.0
+starlette>=0.52.0
+python-multipart>=0.0.22
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+pytest-xdist>=3.5.0
+# Structured logging and metrics
+python-json-logger>=2.0.0
+
+# Prometheus metrics
+prometheus-client>=0.19.0

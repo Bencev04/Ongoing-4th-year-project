@@ -1,0 +1,38 @@
+# Customer Service (Business Logic) Dependencies
+
+# FastAPI and ASGI server
+fastapi>=0.115.0
+starlette>=0.52.0
+uvicorn[standard]>=0.27.0
+
+# Pydantic and settings
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+email-validator>=2.0.0
+
+# Authentication
+python-jose[cryptography]>=3.4.0
+cryptography>=46.0.0
+
+# HTTP client for inter-service communication
+httpx>=0.26.0
+
+# Redis async client for caching
+redis>=5.0.0
+
+# Multipart form support
+python-multipart>=0.0.22
+
+# Structured logging and metrics
+python-json-logger>=2.0.0
+
+# Prometheus metrics
+prometheus-client>=0.19.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+pytest-xdist>=3.5.0  # Parallel test execution
+
+# Development tools (ruff, bandit, mypy) are in requirements-dev.txt at project root

@@ -1,0 +1,62 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: year4-project-dev
+
+# Reference the base configuration
+resources:
+  - namespace.yaml
+  - secrets.yaml
+  - configmap.yaml
+  - ../../base
+
+# Development-specific configuration
+labels:
+  - pairs:
+      app.kubernetes.io/name: year4-project
+      app.kubernetes.io/version: "510e1586"
+      environment: development
+      managed-by: kustomize
+
+commonAnnotations:
+  environment: development
+  deployment.type: dev
+  description: "Development deployment with reduced replicas"
+
+# Development environment uses lower replicas
+replicas:
+  - name: auth-service
+    count: 1
+  - name: user-bl-service
+    count: 1
+  - name: user-db-access-service
+    count: 1
+  - name: job-bl-service-deployment
+    count: 1
+  - name: job-db-access-service-deployment
+    count: 1
+  - name: customer-bl-service
+    count: 1
+  - name: customer-db-access-service
+    count: 1
+  - name: admin-bl-service
+    count: 1
+  - name: maps-access-service
+    count: 1
+  - name: notification-service
+    count: 1
+  - name: frontend-deployment
+    count: 1
+  - name: nginx-gateway
+    count: 1
+
+# Resource patches
+patches:
+  - path: nginx-deployment-patch.yaml
+  # Force containers to always pull images
+  - target:
+      kind: Deployment
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always

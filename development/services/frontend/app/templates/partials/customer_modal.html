@@ -1,0 +1,156 @@
+{# ==========================================================================
+   Customer Create / Edit Modal (HTMX Partial)
+   --------------------------------------------------------------------------
+   Rendered server-side when requested via hx-get.
+   Uses Alpine.js x-data on the parent page for two-way binding;
+   this partial is an alternative to the inline modal already in
+   customers.html and can be loaded via HTMX into #modal-container.
+   ========================================================================== #}
+
+<div class="fixed inset-0 z-50 overflow-y-auto" x-data="{ saving: false, formError: null }">
+    {# Backdrop #}
+    <div class="fixed inset-0 bg-black bg-opacity-50"
+         @click="document.getElementById('modal-container').innerHTML = ''"></div>
+
+    <div class="flex min-h-full items-center justify-center p-4">
+        <div class="relative bg-white rounded-lg shadow-xl w-full max-w-4xl"
+             @click.stop>
+
+            {# Header #}
+            <div class="px-6 py-4 border-b">
+                <h3 class="text-lg font-semibold text-gray-900">
+                    {% if is_edit %}Edit Customer{% else %}Add New Customer{% endif %}
+                </h3>
+                <button @click="document.getElementById('modal-container').innerHTML = ''"
+                        class="absolute top-4 right-4 text-gray-400 hover:text-gray-600">
+                    <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+
+            {# Form body #}
+            <form @submit.prevent="saving = true; /* delegate to customersApp saveCustomer */">
+                <div class="flex">
+                {# Left column — Form fields #}
+                <div class="flex-1 px-6 py-4 space-y-4">
+
+                {# Names #}
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">First Name *</label>
+                        <input type="text" name="first_name" required
+                               class="mt-1 block w-full border border-gray-300 rounded-md text-sm py-2 px-3
+                                      focus:ring-teal-500 focus:border-teal-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">Last Name *</label>
+                        <input type="text" name="last_name" required
+                               class="mt-1 block w-full border border-gray-300 rounded-md text-sm py-2 px-3
+                                      focus:ring-teal-500 focus:border-teal-500">
+                    </div>
+                </div>
+
+                {# Email #}
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Email</label>
+                    <input type="email" name="email"
+                           class="mt-1 block w-full border border-gray-300 rounded-md text-sm py-2 px-3
+                                  focus:ring-teal-500 focus:border-teal-500">
+                </div>
+
+                {# Phone #}
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Phone</label>
+                    <input type="tel" name="phone"
+                           class="mt-1 block w-full border border-gray-300 rounded-md text-sm py-2 px-3
+                                  focus:ring-teal-500 focus:border-teal-500">
+                </div>
+
+                {# Company #}
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Company</label>
+                    <input type="text" name="company"
+                           class="mt-1 block w-full border border-gray-300 rounded-md text-sm py-2 px-3
+                                  focus:ring-teal-500 focus:border-teal-500">
+                </div>
+
+                {# Address + Eircode with Maps autocomplete #}
+                <div x-init="
+                    $nextTick(function() {
+                        initEircodeAutoPopulate('customer-eircode', 'customer-address', 'customer-latitude', 'customer-longitude', {
+                            mapPreview: 'customer-map-preview'
+                        });
+                        if (window.mapsReady) {
+                            initAddressAutocomplete('customer-address', {
+                                latField: 'customer-latitude', lngField: 'customer-longitude',
+                                eircodeField: 'customer-eircode', mapPreview: 'customer-map-preview'
+                            });
+                        }
+                    });
+                ">
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700">Address</label>
+                        <input type="text" id="customer-address" name="address"
+                               class="mt-1 block w-full border border-gray-300 rounded-md text-sm py-2 px-3
+                                      focus:ring-teal-500 focus:border-teal-500">
+                    </div>
+
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">Eircode</label>
+                        <input type="text" id="customer-eircode" name="eircode" placeholder="e.g. D02 XY45"
+                               class="mt-1 block w-full border border-gray-300 rounded-md text-sm py-2 px-3
+                                      focus:ring-teal-500 focus:border-teal-500">
+                    </div>
+
+                    <input type="hidden" id="customer-latitude" name="latitude">
+                    <input type="hidden" id="customer-longitude" name="longitude">
+                </div>
+
+                {# Error feedback #}
+                <div x-show="formError" class="rounded-md bg-red-50 p-3">
+                    <p class="text-sm text-red-700" x-text="formError"></p>
+                </div>
+                </div>{# /left column #}
+
+                {# Right column — Map preview #}
+                <div class="hidden md:flex w-72 flex-col border-l border-gray-100 bg-gray-50/50 p-4">
+                    <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">
+                        <svg class="inline h-3.5 w-3.5 mr-1 -mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/>
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/>
+                        </svg>
+                        Location
+                    </p>
+                    <div id="customer-map-preview" class="flex-1 rounded-lg overflow-hidden bg-gray-100 min-h-[250px]">
+                        <div class="flex items-center justify-center h-full text-gray-400 text-sm p-4">
+                            <div class="text-center">
+                                <svg class="mx-auto h-10 w-10 mb-2 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/>
+                                </svg>
+                                <p class="text-xs">Enter an address or eircode to preview location</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                </div>{# /flex #}
+
+                {# Actions #}
+                <div class="flex justify-end space-x-3 px-6 py-3 border-t border-gray-100">
+                    <button type="button"
+                            @click="document.getElementById('modal-container').innerHTML = ''"
+                            class="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium
+                                   text-gray-700 bg-white hover:bg-gray-50 transition-colors">
+                        Cancel
+                    </button>
+                    <button type="submit" :disabled="saving"
+                            class="px-4 py-2 bg-teal-500 text-white text-sm font-medium rounded-md
+                                   hover:bg-teal-600 disabled:opacity-50 transition-colors">
+                        {% if is_edit %}Update{% else %}Create{% endif %}
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>

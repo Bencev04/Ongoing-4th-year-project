@@ -1,0 +1,739 @@
+<!-- Job Create/Edit Modal (HTMX partial) -->
+{#
+  Job Modal — Create or edit a job.
+
+  Uses hx-ext="json-enc" so HTMX sends the form as application/json
+  (the BL service expects JSON, not form-encoded data).
+
+  After successful submission the modal:
+    1. Triggers 'calendarUpdated' + 'jobQueueUpdated' on <body>
+       so both the calendar grid and the job queue panel refresh.
+    2. Clears #modal-container to close itself.
+
+  Template Variables:
+  ─────────────────
+  is_edit   : bool       — True when editing an existing job.
+  job       : dict|None  — Existing job data (edit mode).
+  date      : str|None   — Pre-filled scheduled date (from day-click).
+  employees : list[dict] — Available employees for the assign dropdown.
+  customers : list[dict] — Available customers for the customer dropdown.
+#}
+
+<div class="fixed inset-0 z-50 overflow-y-auto"
+     x-data="{
+         open: true,
+         showNewCustomerForm: false,
+         savingNewCustomer: false,
+         newCustomerError: '',
+         sendWelcomeEmail: false,
+         sendWelcomeWhatsapp: false,
+         customerMap: {
+             {% for cust in customers %}
+             '{{ cust.id }}': {
+                 email: {{ cust.email|tojson if cust.email else 'null' }},
+                 phone: {{ cust.phone|tojson if cust.phone else 'null' }},
+                 notify_email: {{ 'true' if cust.notify_email else 'false' }},
+                 notify_whatsapp: {{ 'true' if cust.notify_whatsapp else 'false' }}
+             },
+             {% endfor %}
+         },
+         get selectedCustomerData() {
+             const sel = document.getElementById('customer_id');
+             return sel ? (this.customerMap[sel.value] || null) : null;
+         },
+         newCustomerForm: {
+             first_name: '',
+             last_name: '',
+             email: '',
+             phone: '',
+             company: '',
+             address: '',
+             eircode: '',
+             latitude: null,
+             longitude: null
+         },
+
+         resetNewCustomerForm() {
+             this.newCustomerError = '';
+             this.newCustomerForm = {
+                 first_name: '',
+                 last_name: '',
+                 email: '',
+                 phone: '',
+                 company: '',
+                 address: '',
+                 eircode: '',
+                 latitude: null,
+                 longitude: null
+             };
+         },
+
+         async createCustomerAndSelect() {
+             this.newCustomerError = '';
+
+             const firstName = this.newCustomerForm.first_name.trim();
+             const lastName = this.newCustomerForm.last_name.trim();
+
+             if (!firstName || !lastName) {
+                 this.newCustomerError = 'First name and last name are required.';
+                 return;
+             }
+
+             const payload = {
+                 first_name: firstName,
+                 last_name: lastName,
+                 email: this.newCustomerForm.email.trim() || null,
+                 phone: this.newCustomerForm.phone.trim() || null,
+                 company: this.newCustomerForm.company.trim() || null,
+                 address: this.newCustomerForm.address.trim() || null,
+                 eircode: this.newCustomerForm.eircode.trim() || null,
+                 latitude: this.newCustomerForm.latitude,
+                 longitude: this.newCustomerForm.longitude
+             };
+
+             this.savingNewCustomer = true;
+             try {
+                 const response = await authFetch('/api/customers/', {
+                     method: 'POST',
+                     headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify(payload)
+                 });
+
+                 const data = await response.json().catch(() => null);
+                 if (!response.ok) {
+                     this.newCustomerError = data?.detail || `Unable to create customer (${response.status}).`;
+                     return;
+                 }
+
+                 const customerId = String(data?.id || '');
+                 if (!customerId) {
+                     this.newCustomerError = 'Customer created, but no customer ID was returned.';
+                     return;
+                 }
+
+                 const customerName = `${data?.first_name || firstName} ${data?.last_name || lastName}`.trim();
+                 const customerSelect = document.getElementById('customer_id');
+
+                 if (customerSelect) {
+                     let existingOption = Array.from(customerSelect.options).find((opt) => opt.value === customerId);
+                     if (!existingOption) {
+                         existingOption = new Option(customerName, customerId, true, true);
+                         customerSelect.add(existingOption);
+                     }
+                     existingOption.text = customerName;
+                     customerSelect.value = customerId;
+                 }
+
+                 this.showNewCustomerForm = false;
+                 this.resetNewCustomerForm();
+             } catch (error) {
+                 this.newCustomerError = 'Unable to create customer right now. Please try again.';
+                 console.error('Failed to create customer from job modal:', error);
+             } finally {
+                 this.savingNewCustomer = false;
+             }
+         }
+     }"
+     x-show="open"
+     x-transition:enter="ease-out duration-300"
+     x-transition:enter-start="opacity-0"
+     x-transition:enter-end="opacity-100"
+     x-transition:leave="ease-in duration-200"
+     x-transition:leave-start="opacity-100"
+     x-transition:leave-end="opacity-0">
+
+    <!-- Backdrop -->
+    <div class="fixed inset-0 bg-gray-900/60 backdrop-blur-sm"
+         @click="open = false; setTimeout(() => document.getElementById('modal-container').innerHTML = '', 200)">
+    </div>
+
+    <!-- Modal Content -->
+    <div class="flex min-h-full items-center justify-center p-4">
+        <div class="relative bg-white rounded-2xl shadow-2xl max-w-7xl w-full max-h-[90vh] flex flex-col ring-1 ring-black/5"
+             @click.stop
+             x-transition:enter="ease-out duration-300"
+             x-transition:enter-start="opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95"
+             x-transition:enter-end="opacity-100 translate-y-0 sm:scale-100"
+             x-transition:leave="ease-in duration-200"
+             x-transition:leave-start="opacity-100 translate-y-0 sm:scale-100"
+             x-transition:leave-end="opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95">
+
+            <!-- Modal Header -->
+            <div class="flex-shrink-0 px-6 py-4 border-b border-gray-100 bg-gradient-to-r from-gray-50 to-white flex items-center justify-between">
+                <div class="flex items-center space-x-3">
+                    <div class="h-9 w-9 rounded-xl bg-gradient-to-br from-orange-400 to-orange-600 flex items-center justify-center shadow-sm">
+                        <svg class="h-5 w-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            {% if is_edit %}
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                            {% else %}
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4"/>
+                            {% endif %}
+                        </svg>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-bold text-gray-900 tracking-tight">
+                            {% if is_edit %}Edit Job{% else %}Create New Job{% endif %}
+                        </h3>
+                        <p class="text-xs text-gray-500">{% if is_edit %}Update job details below{% else %}Fill in the job details below{% endif %}</p>
+                    </div>
+                </div>
+                <button @click="open = false; setTimeout(() => document.getElementById('modal-container').innerHTML = '', 200)"
+                        class="h-8 w-8 rounded-lg hover:bg-gray-100 flex items-center justify-center transition-colors">
+                    <svg class="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Modal Body -->
+            <form class="flex flex-col flex-1 min-h-0"
+                  {% if is_edit %}hx-put="/api/jobs/{{ job.id }}"{% else %}hx-post="/api/jobs"{% endif %}
+                  hx-ext="json-enc"
+                  hx-swap="none"
+                  hx-on::config-request="
+                      var p = event.detail.parameters;
+                      /* Merge separate date + time inputs into ISO datetime */
+                      var sd = p.start_date || '';
+                      var st = p.start_time_display || '09:00';
+                      var ed = p.end_date || '';
+                      var et = p.end_time_display || '17:00';
+                      if (sd) { p.start_time = sd + 'T' + st + ':00'; }
+                      if (ed) { p.end_time = ed + 'T' + et + ':00'; }
+                      delete p.start_date;
+                      delete p.start_time_display;
+                      delete p.end_date;
+                      delete p.end_time_display;
+                      /* Coerce empty strings to null for optional int fields */
+                      ['customer_id', 'assigned_to'].forEach(function(k) {
+                          if (p[k] === '' || p[k] === undefined) { p[k] = null; }
+                      });
+                      /* Coerce lat/lng strings to floats or null */
+                      ['latitude', 'longitude'].forEach(function(k) {
+                          if (p[k] !== undefined && p[k] !== '' && p[k] !== null) {
+                              p[k] = parseFloat(p[k]);
+                              if (isNaN(p[k])) { p[k] = null; }
+                          } else {
+                              p[k] = null;
+                          }
+                      });
+                      /* Coerce welcome-message flags to actual booleans */
+                      p.send_welcome_email = (p.send_welcome_email === 'true');
+                      p.send_welcome_whatsapp = (p.send_welcome_whatsapp === 'true');
+                      /* Remove fields the BL service sets from JWT context */
+                      delete p.owner_id;
+                      delete p.created_by_id;
+                  "
+                  hx-on::after-request="
+                      if (event.detail.successful) {
+                          htmx.trigger(document.body, 'calendarUpdated');
+                          htmx.trigger(document.body, 'jobQueueUpdated');
+                          document.getElementById('modal-container').innerHTML = '';
+                      }
+                  "
+                  >
+
+                <div class="flex flex-1 min-h-0 overflow-hidden">
+                {# Left column — Form fields #}
+                <div class="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+                    <!-- Title -->
+                    <div>
+                        <label for="title" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                            Job Title <span class="text-red-400">*</span>
+                        </label>
+                        <input type="text"
+                               id="title"
+                               name="title"
+                               required
+                               value="{{ job.title if job else '' }}"
+                               class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                               placeholder="e.g., Kitchen Renovation">
+                    </div>
+
+                    <!-- Description -->
+                    <div>
+                        <label for="description" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                            Description
+                        </label>
+                        <textarea id="description"
+                                  name="description"
+                                  rows="3"
+                                  class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                                  placeholder="Job details...">{{ job.description if job else '' }}</textarea>
+                    </div>
+
+                    <!-- Schedule Section -->
+                    <div>
+                        <div class="flex items-center space-x-2 mb-3">
+                            <svg class="h-4 w-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                            </svg>
+                            <span class="text-xs font-bold text-gray-500 uppercase tracking-wider">Schedule</span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label for="start_date" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                                    Start Date
+                                </label>
+                                <input type="date"
+                                       id="start_date"
+                                       name="start_date"
+                                       value="{{ start_date or '' }}"
+                                       required
+                                       class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm">
+                            </div>
+                            <div>
+                                <label for="start_time_input" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                                    Start Time
+                                </label>
+                                <input type="time"
+                                       id="start_time_input"
+                                       name="start_time_display"
+                                       value="{{ start_time or '09:00' }}"
+                                       required
+                                       class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm">
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3 mt-3">
+                            <div>
+                                <label for="end_date" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                                    End Date
+                                </label>
+                                <input type="date"
+                                       id="end_date"
+                                       name="end_date"
+                                       value="{{ end_date or '' }}"
+                                       required
+                                       class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm">
+                            </div>
+                            <div>
+                                <label for="end_time_input" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                                    End Time
+                                </label>
+                                <input type="time"
+                                       id="end_time_input"
+                                       name="end_time_display"
+                                       value="{{ end_time or '17:00' }}"
+                                       required
+                                       class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Status -->
+                    <div>
+                        <label for="status" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                            Status
+                        </label>
+                        <select id="status"
+                                name="status"
+                                class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm">
+                            <option value="pending" {% if not job or job.status == 'pending' %}selected{% endif %}>Pending</option>
+                            <option value="scheduled" {% if job and job.status == 'scheduled' %}selected{% endif %}>Scheduled</option>
+                            <option value="in_progress" {% if job and job.status == 'in_progress' %}selected{% endif %}>In Progress</option>
+                            <option value="completed" {% if job and job.status == 'completed' %}selected{% endif %}>Completed</option>
+                            <option value="cancelled" {% if job and job.status == 'cancelled' %}selected{% endif %}>Cancelled</option>
+                        </select>
+                    </div>
+
+                    <!-- Assignment Row -->
+                    <div>
+                        <div class="flex items-center space-x-2 mb-3">
+                            <svg class="h-4 w-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>
+                            </svg>
+                            <span class="text-xs font-bold text-gray-500 uppercase tracking-wider">Assignment</span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label for="assigned_to" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                                    Assign To
+                                </label>
+                                <select id="assigned_to"
+                                        name="assigned_to"
+                                        class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm">
+                                    <option value="">-- Select Employee --</option>
+                                    {% for emp in employees %}
+                                    <option value="{{ emp.id }}"
+                                            {% if job and job.assigned_to == emp.id %}selected{% endif %}>
+                                        {{ emp.first_name }} {{ emp.last_name }}
+                                    </option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div>
+                                <label for="customer_id" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                                    Customer
+                                </label>
+                                <select id="customer_id"
+                                        name="customer_id"
+                                        @change="sendWelcomeEmail = false; sendWelcomeWhatsapp = false"
+                                        class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm">
+                                    <option value="">-- Select Customer --</option>
+                                    {% for cust in customers %}
+                                    <option value="{{ cust.id }}"
+                                            {% if job and job.customer_id == cust.id %}selected{% endif %}>
+                                        {{ cust.first_name }} {{ cust.last_name }}
+                                    </option>
+                                    {% endfor %}
+                                </select>
+                                <div class="mt-2">
+                                    <button type="button"
+                                            @click="showNewCustomerForm = true; resetNewCustomerForm()"
+                                            class="inline-flex items-center rounded-lg px-2.5 py-1.5 text-xs font-semibold transition-colors border border-orange-200 bg-orange-50 text-orange-700 hover:bg-orange-100">
+                                        <svg class="mr-1.5 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                            <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
+                                        </svg>
+                                        New Customer
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Location Section -->
+                    <div x-init="
+                        $nextTick(function() {
+                            initEircodeAutoPopulate('eircode', 'address', 'latitude', 'longitude', {
+                                mapPreview: 'job-map-preview'
+                            });
+                            var acOpts = {
+                                latField: 'latitude', lngField: 'longitude',
+                                eircodeField: 'eircode', mapPreview: 'job-map-preview'
+                            };
+                            function initMapStuff() {
+                                initAddressAutocomplete('address', acOpts);
+                                var lat = document.getElementById('latitude')?.value;
+                                var lng = document.getElementById('longitude')?.value;
+                                if (lat && lng) {
+                                    renderStaticMap('job-map-preview', parseFloat(lat), parseFloat(lng));
+                                } else {
+                                    /* Eircode is pre-filled but lat/lng are missing —
+                                       trigger the eircode resolver so the map populates. */
+                                    var ec = document.getElementById('eircode');
+                                    if (ec && ec.value.trim().length >= 3) {
+                                        ec.dispatchEvent(new Event('input', { bubbles: true }));
+                                    }
+                                }
+                            }
+                            if (window.mapsReady) {
+                                initMapStuff();
+                            } else {
+                                document.addEventListener('mapsReady', initMapStuff, { once: true });
+                            }
+                        });
+                    ">
+                        <div class="flex items-center space-x-2 mb-3">
+                            <svg class="h-4 w-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/>
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/>
+                            </svg>
+                            <span class="text-xs font-bold text-gray-500 uppercase tracking-wider">Location</span>
+                        </div>
+                        <div>
+                            <label for="address" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                                Address
+                            </label>
+                            <input type="text"
+                                   id="address"
+                                   name="address"
+                                   value="{{ job.address if job else '' }}"
+                                   class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                                   placeholder="123 Main Street, Dublin">
+                        </div>
+
+                        <div class="mt-3">
+                            <div>
+                                <label for="eircode" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                                    Eircode
+                                </label>
+                                <input type="text"
+                                       id="eircode"
+                                       name="eircode"
+                                       value="{{ job.eircode if job else '' }}"
+                                       class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                                       placeholder="D02 XY45">
+                            </div>
+                        </div>
+
+                        {# Hidden lat/lng fields populated by autocomplete or eircode resolver #}
+                        <input type="hidden" id="latitude" name="latitude"
+                               value="{{ job.latitude if job and job.latitude else '' }}">
+                        <input type="hidden" id="longitude" name="longitude"
+                               value="{{ job.longitude if job and job.longitude else '' }}">
+                    </div>
+
+                    <!-- Notes -->
+                    <div>
+                        <label for="notes" class="block text-sm font-semibold text-gray-700 mb-1.5">
+                            Internal Notes
+                        </label>
+                        <textarea id="notes"
+                                  name="notes"
+                                  rows="2"
+                                  class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                                  placeholder="Notes for your team...">{{ job.notes if job else '' }}</textarea>
+                    </div>
+
+                    {% if not is_edit %}
+                    <!-- Welcome Message Section -->
+                    <div x-show="selectedCustomerData && (selectedCustomerData.notify_email || selectedCustomerData.notify_whatsapp)"
+                         x-transition
+                         class="rounded-xl border border-teal-200 bg-teal-50/50 p-4">
+                        <div class="flex items-center space-x-2 mb-3">
+                            <svg class="h-4 w-4 text-teal-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+                            </svg>
+                            <span class="text-xs font-bold text-teal-700 uppercase tracking-wider">Welcome Message</span>
+                        </div>
+                        <p class="text-xs text-teal-600 mb-3">Send the customer a confirmation with their job details after creation.</p>
+                        <div class="space-y-2">
+                            <label x-show="selectedCustomerData && selectedCustomerData.notify_email && selectedCustomerData.email"
+                                   class="flex items-center space-x-2.5 cursor-pointer group">
+                                <input type="checkbox"
+                                       x-model="sendWelcomeEmail"
+                                       class="h-4 w-4 rounded border-gray-300 text-teal-600 focus:ring-teal-500/30">
+                                <svg class="h-4 w-4 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+                                </svg>
+                                <span class="text-sm text-gray-700 group-hover:text-gray-900">Send confirmation email</span>
+                            </label>
+                            <label x-show="selectedCustomerData && selectedCustomerData.notify_whatsapp && selectedCustomerData.phone"
+                                   class="flex items-center space-x-2.5 cursor-pointer group">
+                                <input type="checkbox"
+                                       x-model="sendWelcomeWhatsapp"
+                                       class="h-4 w-4 rounded border-gray-300 text-green-600 focus:ring-green-500/30">
+                                <svg class="h-4 w-4 text-green-500" viewBox="0 0 24 24" fill="currentColor">
+                                    <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/>
+                                    <path d="M12 2C6.477 2 2 6.477 2 12c0 1.89.525 3.66 1.438 5.168L2 22l4.832-1.438A9.955 9.955 0 0012 22c5.523 0 10-4.477 10-10S17.523 2 12 2zm0 18a8 8 0 01-4.243-1.214l-.258-.153-2.844.845.845-2.844-.154-.258A8 8 0 1112 20z"/>
+                                </svg>
+                                <span class="text-sm text-gray-700 group-hover:text-gray-900">Send WhatsApp confirmation</span>
+                            </label>
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    {# Hidden fields for welcome message flags #}
+                    <input type="hidden" name="send_welcome_email" :value="sendWelcomeEmail">
+                    <input type="hidden" name="send_welcome_whatsapp" :value="sendWelcomeWhatsapp">
+
+                </div>{# /left column #}
+
+                {# Right column — Map preview #}
+                <div class="hidden md:flex w-[36rem] flex-col border-l border-gray-100 bg-gray-50/50 p-4">
+                    <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">
+                        <svg class="inline h-3.5 w-3.5 mr-1 -mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/>
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/>
+                        </svg>
+                        Location
+                    </p>
+                    <div id="job-map-preview" data-map-id="{{ google_maps_map_id or '' }}" class="flex-1 rounded-xl overflow-hidden bg-gray-100 min-h-[500px]">
+                        <div class="flex items-center justify-center h-full text-gray-400 text-sm p-4">
+                            <div class="text-center">
+                                <svg class="mx-auto h-10 w-10 mb-2 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/>
+                                </svg>
+                                <p class="text-xs">Enter an address or eircode to preview location</p>
+                            </div>
+                        </div>
+                    </div>
+                    {% if job and job.latitude and job.longitude %}
+                    <a href="https://www.google.com/maps/dir/?api=1&destination={{ job.latitude }},{{ job.longitude }}"
+                       target="_blank" rel="noopener noreferrer"
+                       class="inline-flex items-center mt-3 text-sm text-teal-600 hover:text-teal-800 transition-colors">
+                        <svg class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/>
+                        </svg>
+                        Get Directions
+                    </a>
+                    {% endif %}
+                </div>
+                </div>{# /flex #}
+
+                <!-- Modal Footer -->
+                <div class="flex-shrink-0 px-6 py-4 border-t border-gray-100 bg-gradient-to-r from-gray-50 to-white flex justify-between items-center">
+                    {% if is_edit %}
+                    <button type="button"
+                            hx-delete="/api/jobs/{{ job.id }}"
+                            hx-confirm="Are you sure you want to delete this job?"
+                            hx-swap="none"
+                            hx-on::after-request="
+                                if (event.detail.successful) {
+                                    htmx.trigger(document.body, 'calendarUpdated');
+                                    htmx.trigger(document.body, 'jobQueueUpdated');
+                                    document.getElementById('modal-container').innerHTML = '';
+                                }
+                            "
+                            class="inline-flex items-center px-3 py-2 text-sm font-medium text-red-600 hover:text-red-700 hover:bg-red-50 rounded-lg transition-colors">
+                        <svg class="h-4 w-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                        </svg>
+                        Delete
+                    </button>
+                    {% else %}
+                    <div></div>
+                    {% endif %}
+
+                    <div class="flex space-x-3">
+                        <button type="button"
+                                @click="open = false; setTimeout(() => document.getElementById('modal-container').innerHTML = '', 200)"
+                                class="px-4 py-2.5 text-sm font-medium text-gray-600 bg-white border border-gray-200 rounded-xl hover:bg-gray-50 hover:border-gray-300 transition-all duration-200 shadow-sm">
+                            Cancel
+                        </button>
+                        <button type="submit"
+                                class="px-5 py-2.5 text-sm font-semibold text-white bg-gradient-to-r from-orange-500 to-orange-600 rounded-xl hover:from-orange-600 hover:to-orange-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-400 shadow-sm hover:shadow-md transition-all duration-200">
+                            {% if is_edit %}Save Changes{% else %}Create Job{% endif %}
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- New Customer Modal (overlays on top of job modal) -->
+    <div x-show="showNewCustomerForm"
+         x-transition:enter="ease-out duration-200"
+         x-transition:enter-start="opacity-0"
+         x-transition:enter-end="opacity-100"
+         x-transition:leave="ease-in duration-150"
+         x-transition:leave-start="opacity-100"
+         x-transition:leave-end="opacity-0"
+         class="fixed inset-0 z-[60] overflow-y-auto"
+         @click.self="showNewCustomerForm = false; resetNewCustomerForm()">
+
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-lg ring-1 ring-black/5"
+                 @click.stop
+                 x-transition:enter="ease-out duration-200"
+                 x-transition:enter-start="opacity-0 scale-95"
+                 x-transition:enter-end="opacity-100 scale-100"
+                 x-transition:leave="ease-in duration-150"
+                 x-transition:leave-start="opacity-100 scale-100"
+                 x-transition:leave-end="opacity-0 scale-95">
+
+                <!-- Header -->
+                <div class="px-6 py-4 border-b border-gray-100 bg-gradient-to-r from-gray-50 to-white flex items-center justify-between">
+                    <div class="flex items-center space-x-3">
+                        <div class="h-9 w-9 rounded-xl bg-gradient-to-br from-orange-400 to-orange-600 flex items-center justify-center shadow-sm">
+                            <svg class="h-5 w-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"/>
+                            </svg>
+                        </div>
+                        <div>
+                            <h3 class="text-lg font-bold text-gray-900 tracking-tight">New Customer</h3>
+                            <p class="text-xs text-gray-500">Create a customer and assign to this job</p>
+                        </div>
+                    </div>
+                    <button @click="showNewCustomerForm = false; resetNewCustomerForm()"
+                            class="h-8 w-8 rounded-lg hover:bg-gray-100 flex items-center justify-center transition-colors">
+                        <svg class="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+
+                <!-- Body -->
+                <div class="px-6 py-5 space-y-4">
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="new_customer_first_name" class="block text-sm font-semibold text-gray-700 mb-1.5">First Name <span class="text-red-400">*</span></label>
+                            <input id="new_customer_first_name"
+                                   type="text"
+                                   x-model="newCustomerForm.first_name"
+                                   class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                                   placeholder="Jane">
+                        </div>
+                        <div>
+                            <label for="new_customer_last_name" class="block text-sm font-semibold text-gray-700 mb-1.5">Last Name <span class="text-red-400">*</span></label>
+                            <input id="new_customer_last_name"
+                                   type="text"
+                                   x-model="newCustomerForm.last_name"
+                                   class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                                   placeholder="Murphy">
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="new_customer_email" class="block text-sm font-semibold text-gray-700 mb-1.5">Email</label>
+                            <input id="new_customer_email"
+                                   type="email"
+                                   x-model="newCustomerForm.email"
+                                   class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                                   placeholder="jane@example.com">
+                        </div>
+                        <div>
+                            <label for="new_customer_phone" class="block text-sm font-semibold text-gray-700 mb-1.5">Phone</label>
+                            <input id="new_customer_phone"
+                                   type="text"
+                                   x-model="newCustomerForm.phone"
+                                   class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                                   placeholder="087 123 4567">
+                        </div>
+                    </div>
+                    <div>
+                        <label for="new_customer_company" class="block text-sm font-semibold text-gray-700 mb-1.5">Company</label>
+                        <input id="new_customer_company"
+                               type="text"
+                               x-model="newCustomerForm.company"
+                               class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                               placeholder="Acme Ltd">
+                    </div>
+                    <div>
+                        <label for="new_customer_address" class="block text-sm font-semibold text-gray-700 mb-1.5">Address</label>
+                        <input id="new_customer_address"
+                               type="text"
+                               x-model="newCustomerForm.address"
+                               class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                               placeholder="12 River Lane, Galway">
+                    </div>
+                    <div>
+                        <label for="new_customer_eircode" class="block text-sm font-semibold text-gray-700 mb-1.5">Eircode</label>
+                        <input id="new_customer_eircode"
+                               type="text"
+                               x-model="newCustomerForm.eircode"
+                               class="w-full px-3.5 py-2.5 border border-gray-200 rounded-xl shadow-sm focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all duration-200 text-sm placeholder:text-gray-400"
+                               placeholder="D02 XY45">
+                    </div>
+
+                    {# Hidden lat/lng for customer creation #}
+                    <input type="hidden" id="new_customer_latitude" x-model="newCustomerForm.latitude">
+                    <input type="hidden" id="new_customer_longitude" x-model="newCustomerForm.longitude">
+
+                    {# Wire up eircode auto-populate for new-customer form #}
+                    <div x-init="
+                        $watch('showNewCustomerForm', (val) => {
+                            if (val) {
+                                $nextTick(function() {
+                                    initEircodeAutoPopulate('new_customer_eircode', 'new_customer_address', 'new_customer_latitude', 'new_customer_longitude');
+                                });
+                            }
+                        });
+                    "></div>
+
+                    <p x-show="newCustomerError"
+                       x-text="newCustomerError"
+                       class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700"></p>
+                </div>
+
+                <!-- Footer -->
+                <div class="px-6 py-4 border-t border-gray-100 bg-gradient-to-r from-gray-50 to-white flex justify-end space-x-3">
+                    <button type="button"
+                            @click="showNewCustomerForm = false; resetNewCustomerForm()"
+                            class="px-4 py-2.5 text-sm font-medium text-gray-600 bg-white border border-gray-200 rounded-xl hover:bg-gray-50 hover:border-gray-300 transition-all duration-200 shadow-sm">
+                        Cancel
+                    </button>
+                    <button type="button"
+                            @click="createCustomerAndSelect()"
+                            :disabled="savingNewCustomer"
+                            class="px-5 py-2.5 text-sm font-semibold text-white bg-gradient-to-r from-orange-500 to-orange-600 rounded-xl hover:from-orange-600 hover:to-orange-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-400 shadow-sm hover:shadow-md transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-60 inline-flex items-center">
+                        <svg x-show="savingNewCustomer" class="mr-1.5 h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"></circle>
+                            <path d="M22 12a10 10 0 00-10-10" stroke="currentColor" stroke-width="3" class="opacity-90"></path>
+                        </svg>
+                        <span x-text="savingNewCustomer ? 'Creating...' : 'Create & Select'"></span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>

@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+
+{# ==========================================================================
+   Terms of Service Page
+   --------------------------------------------------------------------------
+   Public page — accessible without authentication.
+   Last Updated: 21 March 2026  |  Version: 1.0
+   ========================================================================== #}
+
+{% block content %}
+<div class="mx-auto max-w-4xl px-4 sm:px-6 lg:px-8 py-8">
+
+    <h1 class="text-3xl font-bold text-gray-900 mb-2">Terms of Service</h1>
+    <p class="text-sm text-gray-500 mb-8">Last updated: 21 March 2026 &middot; Version 1.0</p>
+
+    <div class="prose prose-gray max-w-none space-y-6">
+
+        <!-- 1. Acceptance -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">1. Acceptance of Terms</h2>
+            <p class="text-gray-700">
+                By logging into or using the Workflow Platform (&ldquo;the Service&rdquo;), you
+                agree to be bound by these Terms of Service and our
+                <a href="/privacy" class="text-teal-600 hover:underline">Privacy Policy</a>.
+                If you do not agree, you must not use the Service.
+            </p>
+        </section>
+
+        <!-- 2. Description of Service -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">2. Description of Service</h2>
+            <p class="text-gray-700">
+                The Service is a CRM Calendar application designed for field-service
+                businesses. It provides job scheduling, customer management, employee
+                management, map-based routing, and notification features. The Service
+                is provided on a multi-tenant basis, with each business's data logically
+                isolated.
+            </p>
+        </section>
+
+        <!-- 3. User Accounts -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">3. User Accounts</h2>
+            <ul class="list-disc pl-6 space-y-1 text-gray-700">
+                <li>You are responsible for maintaining the security of your account credentials.</li>
+                <li>You must not share your login details with unauthorised individuals.</li>
+                <li>You must notify your organisation administrator immediately if you suspect unauthorised access.</li>
+                <li>Accounts are created by organisation owners or administrators. You cannot self-register.</li>
+            </ul>
+        </section>
+
+        <!-- 4. Acceptable Use -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">4. Acceptable Use</h2>
+            <p class="text-gray-700">You agree not to:</p>
+            <ul class="list-disc pl-6 space-y-1 text-gray-700">
+                <li>Use the Service for any unlawful purpose.</li>
+                <li>Attempt to gain unauthorised access to other accounts or tenant data.</li>
+                <li>Upload malicious content or attempt to exploit vulnerabilities.</li>
+                <li>Use the notification system to send unsolicited messages (spam).</li>
+                <li>Reverse-engineer, decompile, or disassemble any part of the Service.</li>
+            </ul>
+        </section>
+
+        <!-- 5. Customer Data Responsibility -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">5. Data Responsibility</h2>
+            <p class="text-gray-700">
+                <strong>Business owners (data controllers)</strong> are responsible for ensuring
+                that all customer data entered into the Service is collected and processed lawfully,
+                with appropriate consent or legal basis under applicable data protection laws
+                (including GDPR).
+            </p>
+            <p class="text-gray-700 mt-2">
+                The platform provides tools for data export and anonymization to help you
+                comply with data subject rights requests. It is your responsibility to use these
+                tools when required.
+            </p>
+        </section>
+
+        <!-- 6. Notifications -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">6. Notifications &amp; Communications</h2>
+            <ul class="list-disc pl-6 space-y-1 text-gray-700">
+                <li>WhatsApp and email notifications are sent to customers only when explicitly
+                    enabled per customer by the business owner.</li>
+                <li>You must have valid customer consent before enabling WhatsApp notifications.</li>
+                <li>The platform relies on third-party services (Twilio, SMTP providers) for
+                    delivery. We cannot guarantee 100% deliverability.</li>
+            </ul>
+        </section>
+
+        <!-- 7. Intellectual Property -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">7. Intellectual Property</h2>
+            <p class="text-gray-700">
+                All rights, title, and interest in the Service (software, design, documentation)
+                remain with the platform provider. Your data remains yours &mdash; we claim no
+                ownership of data you enter into the Service.
+            </p>
+        </section>
+
+        <!-- 8. Availability -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">8. Service Availability</h2>
+            <p class="text-gray-700">
+                We aim to provide high availability but do not guarantee uninterrupted access.
+                Scheduled maintenance and updates may temporarily affect availability. We will
+                endeavour to minimise disruption.
+            </p>
+        </section>
+
+        <!-- 9. Limitation of Liability -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">9. Limitation of Liability</h2>
+            <p class="text-gray-700">
+                To the maximum extent permitted by law, the platform provider is not liable for
+                indirect, incidental, or consequential damages arising from your use of the
+                Service. This includes loss of data, loss of revenue, or interruption of business.
+            </p>
+        </section>
+
+        <!-- 10. Termination -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">10. Termination</h2>
+            <ul class="list-disc pl-6 space-y-1 text-gray-700">
+                <li>Organisation owners may deactivate user accounts at any time.</li>
+                <li>Users may request account anonymization through the Profile page (subject to a 72-hour grace period).</li>
+                <li>We reserve the right to suspend accounts that violate these Terms.</li>
+            </ul>
+        </section>
+
+        <!-- 11. Changes to Terms -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">11. Changes to These Terms</h2>
+            <p class="text-gray-700">
+                We may update these Terms from time to time. Updated Terms will be posted on
+                this page with a revised &ldquo;Last updated&rdquo; date. Continued use of the
+                Service after changes constitutes acceptance.
+            </p>
+        </section>
+
+        <!-- 12. Governing Law -->
+        <section>
+            <h2 class="text-xl font-semibold text-gray-900">12. Governing Law</h2>
+            <p class="text-gray-700">
+                These Terms are governed by the laws of Ireland. Any disputes shall be subject
+                to the exclusive jurisdiction of the courts of Ireland.
+            </p>
+        </section>
+
+    </div>
+</div>
+{% endblock %}

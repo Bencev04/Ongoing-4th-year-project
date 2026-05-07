@@ -1,0 +1,484 @@
+# CRM Calendar Microservices - Docker Compose Configuration
+# Orchestrates all services with PostgreSQL database
+# NGINX gateway is the single public entry point.
+# Local host port mappings live in docker-compose.override.yml so CI runs do not publish shared runner ports.
+
+x-app-observability-env: &app-observability-env
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  SERVICE_VERSION: ${SERVICE_VERSION:-local}
+
+services:
+  # ===========================================================================
+  # NGINX API Gateway — single public entry point
+  # ===========================================================================
+  nginx-gateway:
+    build:
+      context: ./services
+      dockerfile: nginx/Dockerfile
+    container_name: crm_nginx_gateway
+    restart: unless-stopped
+    expose:
+      - "80"
+    depends_on:
+      frontend:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      user-bl-service:
+        condition: service_healthy
+      job-bl-service:
+        condition: service_healthy
+      customer-bl-service:
+        condition: service_healthy
+      admin-bl-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    networks:
+      - crm_network
+
+  # ===========================================================================
+  # Database
+  # ===========================================================================
+  db:
+    image: postgres:15-alpine
+    container_name: crm_calendar_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-crm_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crm_password}
+      POSTGRES_DB: ${POSTGRES_DB:-crm_calendar}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crm_user} -d ${POSTGRES_DB:-crm_calendar}"]
+      interval: 3s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  # ===========================================================================
+  # Redis Cache — token blacklist, session store, response caching
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: crm_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru --appendonly yes --requirepass ${REDIS_PASSWORD:-redis-dev-password}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis-dev-password}
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
+      interval: 3s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    networks:
+      - crm_network
+
+  # ===========================================================================
+  # Alembic Migration Runner — runs before any app service starts
+  # ===========================================================================
+  migration-runner:
+    build:
+      context: ./services
+      dockerfile: migration-runner/Dockerfile
+    container_name: crm_migration_runner
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@db:5432/${POSTGRES_DB:-crm_calendar}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - crm_network
+
+  # ===========================================================================
+  # DB Access Layer (internal only — no external ports)
+  # ===========================================================================
+
+  user-db-access-service:
+    build:
+      context: ./services
+      dockerfile: user-db-access-service/Dockerfile
+    container_name: crm_user_db_access_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@db:5432/${POSTGRES_DB:-crm_calendar}
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8001"
+    depends_on:
+      db:
+        condition: service_healthy
+      migration-runner:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  customer-db-access-service:
+    build:
+      context: ./services
+      dockerfile: customer-db-access-service/Dockerfile
+    container_name: crm_customer_db_access_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@db:5432/${POSTGRES_DB:-crm_calendar}
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8002"
+    depends_on:
+      db:
+        condition: service_healthy
+      migration-runner:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  job-db-access-service:
+    build:
+      context: ./services
+      dockerfile: job-db-access-service/Dockerfile
+    container_name: crm_job_db_access_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@db:5432/${POSTGRES_DB:-crm_calendar}
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8003"
+    depends_on:
+      db:
+        condition: service_healthy
+      migration-runner:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  # ===========================================================================
+  # Maps Access Layer (internal only — wraps Google Maps API)
+  # ===========================================================================
+
+  maps-access-service:
+    build:
+      context: ./services
+      dockerfile: maps-access-service/Dockerfile
+    container_name: crm_maps_access_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      GOOGLE_MAPS_SERVER_KEY: ${GOOGLE_MAPS_SERVER_KEY:-}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/5
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8009"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8009/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  # ===========================================================================
+  # Business Logic Layer (internal — proxied through NGINX)
+  # ===========================================================================
+
+  auth-service:
+    build:
+      context: ./services
+      dockerfile: auth-service/Dockerfile
+    container_name: crm_auth_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@db:5432/${POSTGRES_DB:-crm_calendar}
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/0
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8005"
+    depends_on:
+      db:
+        condition: service_healthy
+      migration-runner:
+        condition: service_completed_successfully
+      user-db-access-service:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  user-bl-service:
+    build:
+      context: ./services
+      dockerfile: user-bl-service/Dockerfile
+    container_name: crm_user_bl_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/1
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8004"
+    depends_on:
+      - user-db-access-service
+      - auth-service
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  job-bl-service:
+    build:
+      context: ./services
+      dockerfile: job-bl-service/Dockerfile
+    container_name: crm_job_bl_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      JOB_SERVICE_URL: http://job-db-access-service:8003
+      CUSTOMER_SERVICE_URL: http://customer-db-access-service:8002
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      AUTH_SERVICE_URL: http://auth-service:8005
+      MAPS_SERVICE_URL: http://maps-access-service:8009
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/2
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8006"
+    depends_on:
+      - job-db-access-service
+      - customer-db-access-service
+      - user-db-access-service
+      - auth-service
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  customer-bl-service:
+    build:
+      context: ./services
+      dockerfile: customer-bl-service/Dockerfile
+    container_name: crm_customer_bl_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      CUSTOMER_SERVICE_URL: http://customer-db-access-service:8002
+      JOB_SERVICE_URL: http://job-db-access-service:8003
+      AUTH_SERVICE_URL: http://auth-service:8005
+      MAPS_SERVICE_URL: http://maps-access-service:8009
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/3
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8007"
+    depends_on:
+      - customer-db-access-service
+      - job-db-access-service
+      - auth-service
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8007/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  # ===========================================================================
+  # Admin BL Service — superadmin-only platform administration
+  # ===========================================================================
+
+  admin-bl-service:
+    build:
+      context: ./services
+      dockerfile: admin-bl-service/Dockerfile
+    container_name: crm_admin_bl_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/4
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8008"
+    depends_on:
+      - user-db-access-service
+      - auth-service
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8008/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  # ===========================================================================
+  # Notification Service — WhatsApp + email notifications
+  # ===========================================================================
+
+  notification-service:
+    build:
+      context: ./services
+      dockerfile: notification-service/Dockerfile
+    container_name: crm_notification_service
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-crm_user}:${POSTGRES_PASSWORD:-crm_password}@db:5432/${POSTGRES_DB:-crm_calendar}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/6
+      AUTH_SERVICE_URL: http://auth-service:8005
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      JOB_BL_SERVICE_URL: http://job-bl-service:8006
+      CUSTOMER_BL_SERVICE_URL: http://customer-bl-service:8007
+      ADMIN_BL_SERVICE_URL: http://admin-bl-service:8008
+      NOTIFICATION_ENCRYPTION_KEY: ${NOTIFICATION_ENCRYPTION_KEY:-generate-a-real-key}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-noreply@workflow.local}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-Workflow Platform}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-false}
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8011"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migration-runner:
+        condition: service_completed_successfully
+      auth-service:
+        condition: service_healthy
+      job-bl-service:
+        condition: service_healthy
+      customer-bl-service:
+        condition: service_healthy
+      admin-bl-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8011/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+  # ===========================================================================
+  # Frontend (internal — served to clients through NGINX)
+  # ===========================================================================
+
+  frontend:
+    build:
+      context: ./services
+      dockerfile: frontend/Dockerfile
+    container_name: crm_frontend
+    restart: unless-stopped
+    environment:
+      <<: *app-observability-env
+      USER_SERVICE_URL: http://user-bl-service:8004
+      CUSTOMER_SERVICE_URL: http://customer-bl-service:8007
+      JOB_SERVICE_URL: http://job-bl-service:8006
+      AUTH_SERVICE_URL: http://auth-service:8005
+      ADMIN_BL_SERVICE_URL: http://admin-bl-service:8008
+      GOOGLE_MAPS_BROWSER_KEY: ${GOOGLE_MAPS_BROWSER_KEY:-}
+      GOOGLE_MAPS_MAP_ID: ${GOOGLE_MAPS_MAP_ID:-}
+      DEBUG: ${DEBUG:-false}
+    expose:
+      - "8000"
+    depends_on:
+      - auth-service
+      - user-bl-service
+      - customer-bl-service
+      - job-bl-service
+      - admin-bl-service
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - crm_network
+
+# Volumes for persistent data
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# Network for inter-service communication
+networks:
+  crm_network:
+    driver: bridge

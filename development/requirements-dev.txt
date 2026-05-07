@@ -1,0 +1,29 @@
+# =============================================================================
+# requirements-dev.txt — Local development tools
+# =============================================================================
+#
+# These tools are used for local development and are NOT installed in
+# production Docker images. CI installs them individually in their own jobs.
+#
+# Usage:
+#   pip install -r requirements-dev.txt
+#
+# What each tool does:
+#   ruff        — Linter + formatter (replaces black + isort + flake8)
+#   bandit      — Python security linter (SAST)
+#   mypy        — Static type checker
+#   types-*     — Type stubs for mypy
+#
+# Note: pytest and test dependencies remain in per-service requirements.txt
+# files because each service has different test dependencies (e.g., aiosqlite
+# for DB-access services, postgres service containers for integration tests).
+
+# Linting & Formatting
+ruff>=0.4.0
+
+# Security Linting
+bandit[toml]>=1.7.0
+
+# Type Checking
+mypy>=1.8.0
+types-requests>=2.31.0

@@ -1,0 +1,92 @@
+# =============================================================================
+# Checkov Configuration
+# =============================================================================
+#
+# Checkov is a static analysis tool by Bridgecrew (now Palo Alto Networks)
+# that scans Terraform for security misconfigurations. It's similar to Trivy
+# but uses a DIFFERENT rule set, so running both catches more issues.
+#
+# WHY USE BOTH TRIVY AND CHECKOV?
+#   - Trivy uses Aqua Security's rules (based on CIS benchmarks)
+#   - Checkov uses Bridgecrew's rules (1000+ built-in checks)
+#   - Each catches things the other misses — defense in depth!
+#
+# WHAT CHECKOV CHECKS:
+#   - CKV_AWS_*   — AWS-specific security checks
+#   - CKV2_AWS_*  — AWS combo checks (multiple resources together)
+#   - CKV_TF_*    — Terraform-specific best practices
+#
+# RUN LOCALLY:
+#   pip install checkov
+#   checkov -d . --config-file .checkov.yml
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Framework: Only scan Terraform files (not Kubernetes, Docker, etc.)
+# Checkov supports many frameworks; we only need Terraform here.
+# -----------------------------------------------------------------------------
+framework:
+  - terraform
+
+# -----------------------------------------------------------------------------
+# Directory: Scan from the repo root to catch all modules
+# -----------------------------------------------------------------------------
+directory:
+  - .
+
+# -----------------------------------------------------------------------------
+# Skip Checks: Known acceptable findings for our college project
+# -----------------------------------------------------------------------------
+# Each skip includes the check ID and a justification for why it's acceptable.
+# This is the Checkov equivalent of our .trivyignore file.
+skip-check:
+  # RDS Multi-AZ: Disabled intentionally to save costs
+  # (Multi-AZ doubles the RDS cost — not worth it for a demo)
+  - CKV_AWS_157  # Ensure that RDS instances have Multi-AZ enabled
+
+  # RDS Deletion Protection: Disabled so `terraform destroy` works
+  # (We need to tear down infrastructure after demos)
+  - CKV_AWS_293  # Ensure that RDS instances have deletion protection enabled
+  - CKV_AWS_162  # Ensure RDS instance has IAM authentication enabled
+
+  # EKS Public Endpoint: Enabled for kubectl access from CI/CD
+  # (Private-only would require a VPN, which adds cost and complexity)
+  - CKV_AWS_39   # Ensure Amazon EKS public endpoint disabled
+
+  # EKS Secrets Encryption: Would require KMS key (extra cost)
+  - CKV_AWS_58   # Ensure EKS secrets are encrypted
+
+  # Redis Transit Encryption: Disabled to avoid TLS overhead in VPC
+  - CKV_AWS_31   # Ensure ElastiCache Redis has in-transit encryption enabled
+
+  # VPC Flow Logs: Would require CloudWatch Logs (extra cost)
+  - CKV2_AWS_11  # Ensure VPC flow logging is enabled
+
+  # NAT Gateway: We use a single NAT gateway instead of per-AZ
+  - CKV2_AWS_12  # Ensure the default security group of every VPC restricts all traffic
+
+  # EKS Logging: Would require CloudWatch (extra cost)
+  - CKV_AWS_37   # Ensure EKS control plane logging enabled
+  - CKV_AWS_38   # Ensure EKS control plane logging enabled for all log types
+
+  # RDS Performance Insights: Extra cost feature
+  - CKV_AWS_353  # Ensure RDS Performance Insights is enabled
+
+  # Enhanced Monitoring: Extra cost
+  - CKV_AWS_118  # Ensure RDS instance has Enhanced Monitoring enabled
+
+  # Auto Minor Version Upgrade (we pin versions explicitly)
+  - CKV_AWS_226  # Ensure RDS auto minor version upgrade is enabled
+
+# -----------------------------------------------------------------------------
+# Compact output: Show only failures, not passing checks
+# Keeps CI/CD logs readable.
+# -----------------------------------------------------------------------------
+compact: true
+
+# -----------------------------------------------------------------------------
+# Soft fail: Exit 0 even if checks fail (for initial adoption)
+# Change to false once all findings are addressed.
+# NOTE: The CI job uses --hard-fail-on HIGH, so HIGH findings still fail.
+# -----------------------------------------------------------------------------
+soft-fail: true

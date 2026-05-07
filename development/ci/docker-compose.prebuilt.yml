@@ -1,0 +1,56 @@
+# Pre-built Image Override — used by integration tests on main branch
+#
+# Usage (main branch, no --build flag):
+#   docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml -f ci/docker-compose.prebuilt.yml up -d
+#
+# Purpose:
+#   On the main branch, the build-scan stage has already built and pushed
+#   RC-tagged images to the registry. This override tells Compose to use those
+#   pre-built images instead of rebuilding from Dockerfiles, avoiding a
+#   double build.
+#
+#   Services NOT listed here (migration-runner, integration-runner) are still
+#   built from source as normal — they are not pushed to the registry.
+#
+# How it works:
+#   When both `build:` and `image:` are set and `--build` is NOT passed,
+#   Compose v2 uses the image if found locally (we pre-pull in the CI script).
+
+services:
+  # nginx-gateway is intentionally NOT listed here.
+  # It builds from source using the NGINX_CONF=nginx/nginx-ci.conf build arg
+  # in docker-compose.ci.yml so that CI-specific rate limits are applied.
+  # (Bind-mount overrides don't work in Docker-socket CI runners.)
+
+  user-db-access-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:user-db-access-service-rc
+
+  customer-db-access-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:customer-db-access-service-rc
+
+  job-db-access-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:job-db-access-service-rc
+
+  auth-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:auth-service-rc
+
+  user-bl-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:user-bl-service-rc
+
+  job-bl-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:job-bl-service-rc
+
+  customer-bl-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:customer-bl-service-rc
+
+  admin-bl-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:admin-bl-service-rc
+
+  maps-access-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:maps-access-service-rc
+
+  notification-service:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:notification-service-rc
+
+  frontend:
+    image: ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:frontend-rc

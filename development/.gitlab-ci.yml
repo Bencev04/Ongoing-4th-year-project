@@ -1,0 +1,1811 @@
+# =============================================================================
+# CRM Calendar Microservices — GitLab CI/CD Pipeline
+# =============================================================================
+#
+# Pipeline Architecture (8 stages):
+#
+#   Feature branches: lint → test → integration  (~8-10 min feedback)
+#   Main branch:      lint → test → build → integration → quality → push → release → deploy
+#
+#   Build happens BEFORE integration so integration tests run against the
+#   actual Docker images that will be deployed. Images are only pushed to
+#   the registry AFTER integration tests pass — no untested images in prod.
+#
+# Security Philosophy — FOSS-First, Defence in Depth:
+#   Open source tools are the HARD pipeline gates (block on failure):
+#     - Ruff       → code quality + formatting (lint stage)
+#     - Bandit     → Python-specific SAST (test stage)
+#     - Gitleaks   → secret detection across all branches (test stage)
+#     - Trivy      → dependency CVEs + container image CVEs (test + build stages)
+#     - pytest     → unit tests with 80% coverage gate (test stage)
+#
+#   Commercial tools are SOFT/INFORMATIONAL (dashboard only, never block):
+#     - SonarCloud → code quality dashboard (quality stage, allow_failure: true)
+#     - Aikido     → security dashboard (release stage, allow_failure: true)
+#
+#   Rationale: Free-tier quotas on SonarCloud and Aikido can exhaust mid-pipeline,
+#   causing spurious failures unrelated to code quality. FOSS tools have no
+#   limits, run offline, and provide the same or better coverage. Commercial
+#   tools are kept for their dashboards, trend tracking, and additional context.
+#
+# Every job prints a formatted summary at the bottom of its output using
+# the project convention: ═══ separators, ✅/❌/✓/✗ symbols, ACTION REQUIRED.
+
+workflow:
+  rules:
+    # Prefer merge-request pipelines over duplicate push pipelines for branches
+    # that already have an open MR.
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+stages:
+  - lint             # Code quality + formatting (all branches, fast-fail)
+  - test             # Unit tests + security scans per service (all branches)
+  - build            # Build + Trivy image scan, push RC tags (main only)
+  - integration      # Full-stack integration tests via Docker Compose (all branches)
+  - quality          # SonarCloud dashboard analysis (main only, informational)
+  - push             # Re-tag RC → final + latest, push to registry (main only)
+  - release          # Aikido dashboard scan (main only, informational)
+  - deploy           # Trigger deployment repo (main only, automatic)
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  # Fresh clone avoids shallow.lock race conditions when concurrent jobs
+  # share the same runner build directory (GIT_DEPTH keeps it shallow/fast).
+  GIT_STRATEGY: clone
+  # Image prefix — set to "" for direct Docker Hub pulls (authenticated).
+  # To use GitLab Dependency Proxy instead, override in CI/CD Variables:
+  #   IMG_PFX = "$CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX/"
+  #
+  # Docker Hub authentication (Settings → CI/CD → Variables):
+  #   DOCKERHUB_USER  — Docker Hub username
+  #   DOCKERHUB_TOKEN — Docker Hub access token (read-only)
+  #   DOCKER_AUTH_CONFIG — authenticates runner image pulls (see README)
+  IMG_PFX: ""
+  # Container registry — works with GitLab CR or Docker Hub
+  # For Docker Hub: Set CI_REGISTRY_IMAGE = username/repository
+  IMAGE_TAG: "$CI_REGISTRY_IMAGE"
+  IMAGE_VERSION: "$CI_COMMIT_SHORT_SHA"
+  SERVICE_VERSION: "$CI_COMMIT_SHORT_SHA"
+  # Deployment repo mode: auto | validate-only | staging-only | staging-teardown-test | full-release
+  # Override when manually/push-option triggering dev CI to control how far CD runs.
+  PIPELINE_MODE: "auto"
+  ENVIRONMENT: "ci"
+  LOG_LEVEL: "INFO"
+  COMPOSE_PROJECT_NAME: "crm-${CI_PIPELINE_ID}-${CI_JOB_ID}"
+  # Deployment repository settings
+  # The job automatically uses CI_JOB_TOKEN (GitLab's built-in authentication)
+  # No additional CI/CD variables required to clone the deployment repo.
+  #
+  # Optional CI/CD variable to customize:
+  #   DEPLOY_REPO_BRANCH — Target branch in deployment repo (default: main)
+
+# =============================================================================
+# DEFAULT — shared settings for Python-based jobs
+# =============================================================================
+
+default:
+  image: ${IMG_PFX}python:3.11-slim
+  interruptible: true
+  cache:
+    key:
+      files:
+        - "**/requirements.txt"
+    paths:
+      - .cache/pip
+  before_script:
+    - pip install --upgrade pip
+
+# =============================================================================
+# HIDDEN TEMPLATES — reusable job definitions to reduce duplication
+# =============================================================================
+#
+# .test_bl:  BL/frontend services (tests in app/tests/, no database needed)
+# .test_db:  DB-access services (tests in tests/, Postgres service container)
+#
+# Each concrete test job only needs to set SERVICE_NAME via variables.
+
+.test_base:
+  stage: test
+  needs: []
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/${SERVICE_NAME}/coverage.xml
+    paths:
+      - services/${SERVICE_NAME}/coverage.xml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+.test_bl:
+  extends: .test_base
+  script:
+    - cd services/${SERVICE_NAME}
+    - pip install -r requirements.txt
+    - pytest app/tests/ -n auto --cov=app --cov-report=xml:../../services/${SERVICE_NAME}/coverage.xml --cov-fail-under=80
+
+.test_db:
+  extends: .test_base
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: testuser
+    POSTGRES_PASSWORD: testpass
+    DATABASE_URL: "postgresql://testuser:testpass@postgres:5432/test_db"
+  script:
+    - cd services/${SERVICE_NAME}
+    - pip install -r requirements.txt
+    - pytest tests/ -n auto --cov=app --cov-report=xml:../../services/${SERVICE_NAME}/coverage.xml --cov-fail-under=80
+
+.test_scripts:
+  extends: .test_base
+  script:
+    - cd services/${SERVICE_NAME}
+    - pip install -r requirements.txt pytest pytest-cov pytest-xdist
+    - python -m pytest tests/ -n auto --cov=run_migrations --cov-report=xml:../../services/${SERVICE_NAME}/coverage.xml --cov-fail-under=80
+
+# =============================================================================
+# STAGE 0: LINT — code quality fast-fail gate (ALL branches)
+# =============================================================================
+# Runs BEFORE unit tests. If code doesn't pass linting or formatting checks,
+# the pipeline fails immediately — no point running tests on badly formatted
+# code. This saves CI minutes on every push.
+#
+# Two parallel jobs:
+#   1. ruff-check   — Formatting + linting + import ordering (HARD GATE)
+#   2. mypy-check   — Static type checking (SOFT — informational for now)
+#
+# Decision: Separate stage (not parallel with tests) because lint failures
+# should prevent ALL downstream work. A 15-second lint check that catches
+# issues before 3+ minutes of unit tests is a net time saver.
+
+# -----------------------------------------------------------------------------
+# Ruff — Linter + Formatter (replaces black + isort + flake8)
+# -----------------------------------------------------------------------------
+# Ruff is a single Rust-based tool that replaces three separate Python tools:
+#   - black  → formatting (ruff format)
+#   - isort  → import sorting (ruff check --select I)
+#   - flake8 → linting rules (ruff check --select E,F,B,UP,S)
+#
+# It runs ~100x faster than the tools it replaces. Configuration is in
+# pyproject.toml at the project root.
+#
+# Why Ruff over black/isort/flake8?
+#   - Single tool instead of three → simpler CI, fewer dependencies
+#   - ~100x faster → lint stage completes in ~10 seconds
+#   - Superset of rules → catches more issues than flake8 alone
+#   - Active development with monthly releases and growing rule set
+
+ruff-check:
+  stage: lint
+  needs: []
+  script:
+    - pip install ruff
+    - |
+      echo "========================================="
+      echo "Running Ruff linter and formatter check"
+      echo "========================================="
+      echo ""
+
+      # Track overall result
+      LINT_FAILED=0
+      FORMAT_FAILED=0
+
+      # Phase 1: Lint check (pycodestyle, pyflakes, isort, bugbear, security)
+      echo "── Phase 1: Lint rules ──"
+      if ruff check services/ --output-format concise 2>&1; then
+        echo "  ✓ All lint rules passed"
+      else
+        LINT_FAILED=1
+      fi
+      echo ""
+
+      # Save JSON report for artifact regardless of pass/fail
+      ruff check services/ --output-format json > ruff-report.json 2>&1 || true
+
+      # Phase 2: Format check (equivalent to black --check + isort --check)
+      echo "── Phase 2: Formatting check ──"
+      if ruff format --check services/ 2>&1; then
+        echo "  ✓ All files correctly formatted"
+      else
+        FORMAT_FAILED=1
+      fi
+      echo ""
+
+      # Count files scanned for the summary
+      FILE_COUNT=$(find services/ -name "*.py" -not -path "*/__pycache__/*" | wc -l)
+
+      # ── SUMMARY (always at the bottom) ──
+      echo ""
+      echo "========================================="
+      echo "RUFF LINT & FORMAT SUMMARY"
+      echo "========================================="
+
+      if [ "$LINT_FAILED" -eq 0 ] && [ "$FORMAT_FAILED" -eq 0 ]; then
+        echo "✅ All $FILE_COUNT Python files pass linting and formatting"
+        echo ""
+        echo "Rules checked:"
+        echo "  ✓ E   — pycodestyle errors"
+        echo "  ✓ F   — pyflakes (unused imports, undefined names)"
+        echo "  ✓ I   — isort (import ordering)"
+        echo "  ✓ B   — bugbear (common Python pitfalls)"
+        echo "  ✓ UP  — pyupgrade (modern Python syntax)"
+        echo "  ✓ S   — security (flake8-bandit subset)"
+      else
+        if [ "$LINT_FAILED" -eq 1 ]; then
+          echo "❌ Lint violations found"
+        else
+          echo "✅ Lint rules passed"
+        fi
+
+        if [ "$FORMAT_FAILED" -eq 1 ]; then
+          echo "❌ Formatting violations found"
+        else
+          echo "✅ Formatting passed"
+        fi
+
+        echo ""
+        echo "ACTION REQUIRED:"
+        echo "  1. Run: ruff check --fix services/"
+        echo "  2. Run: ruff format services/"
+        echo "  3. Review changes and commit"
+        echo "  4. Download ruff-report.json artifact for full details"
+        echo ""
+        exit 1
+      fi
+  artifacts:
+    paths:
+      - ruff-report.json
+    expire_in: 1 week
+    when: always
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# -----------------------------------------------------------------------------
+# mypy — Static type checker (informational, soft-fail)
+# -----------------------------------------------------------------------------
+# mypy checks type annotations across all service code. Currently set to
+# allow_failure: true because the codebase is not yet fully type-annotated.
+# This job provides visibility into type safety without blocking development.
+#
+# Promote to allow_failure: false once the codebase reaches full type coverage.
+#
+# Configuration is in pyproject.toml [tool.mypy] section.
+
+mypy-check:
+  stage: lint
+  needs: []
+  script:
+    - pip install mypy types-requests
+    - |
+      echo "========================================="
+      echo "Running mypy static type checker"
+      echo "========================================="
+      echo ""
+
+      # Run mypy per service. Each microservice owns a top-level package named
+      # "app", so checking services/ in one invocation maps them as duplicates.
+      # Type findings stay informational; infrastructure/config failures still fail.
+      set +e
+      MYPY_OUTPUT=$(
+        MYPY_EXIT=0
+        for TARGET in services/*/app services/shared/common; do
+          [ -d "$TARGET" ] || continue
+          echo "── $TARGET ──"
+          mypy "$TARGET" --ignore-missing-imports --no-error-summary 2>&1
+          TARGET_EXIT=$?
+          if [ "$TARGET_EXIT" -gt "$MYPY_EXIT" ]; then
+            MYPY_EXIT=$TARGET_EXIT
+          fi
+        done
+        exit "$MYPY_EXIT"
+      )
+      MYPY_EXIT=$?
+      set -e
+      ERROR_COUNT=$(echo "$MYPY_OUTPUT" | grep -c ": error:" || true)
+      DUPLICATE_MODULE_COUNT=$(echo "$MYPY_OUTPUT" | grep -c "Duplicate module named" || true)
+
+      # Print the full output for context
+      echo "$MYPY_OUTPUT"
+      echo ""
+
+      # ── SUMMARY ──
+      echo ""
+      echo "========================================="
+      echo "MYPY TYPE CHECK SUMMARY"
+      echo "========================================="
+
+      if [ "$MYPY_EXIT" -eq 0 ]; then
+        echo "✅ No type errors found"
+      elif [ "$DUPLICATE_MODULE_COUNT" -gt 0 ]; then
+        echo "❌ mypy module discovery failed"
+        echo ""
+        echo "ACTION REQUIRED: review per-service mypy target discovery above"
+        exit "$MYPY_EXIT"
+      elif [ "$MYPY_EXIT" -gt 1 ]; then
+        echo "❌ mypy failed before completing normal type checks"
+        echo ""
+        echo "ACTION REQUIRED: review the command output above"
+        exit "$MYPY_EXIT"
+      elif [ "$ERROR_COUNT" -gt 0 ]; then
+        echo "⚠️  $ERROR_COUNT type error(s) found (informational — does not block pipeline)"
+        echo ""
+        echo "ACTION REQUIRED (optional):"
+        echo "  1. Review type errors above"
+        echo "  2. Add type annotations to function signatures"
+        echo "  3. Run: for target in services/*/app services/shared/common; do [ -d \"\$target\" ] && mypy \"\$target\" --ignore-missing-imports; done"
+      else
+        echo "❌ mypy failed before producing type-error output"
+        echo ""
+        echo "ACTION REQUIRED: review the command output above"
+        exit "$MYPY_EXIT"
+      fi
+
+      exit 0
+  allow_failure: true  # Soft gate — promote to hard once codebase is type-clean
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# =============================================================================
+# STAGE 1: UNIT TESTS — run per-service tests (ALL branches)
+# =============================================================================
+# Each service runs in parallel. DB-access services spin up Postgres.
+# Coverage reports (Cobertura XML) are passed as artifacts to the quality stage.
+# Runs on every branch push so developers get immediate feedback.
+#
+# Gate: 80% minimum coverage per service (--cov-fail-under=80)
+
+test:auth-service:
+  extends: .test_bl
+  variables:
+    SERVICE_NAME: auth-service
+
+test:admin-bl-service:
+  extends: .test_bl
+  variables:
+    SERVICE_NAME: admin-bl-service
+
+test:customer-db-access-service:
+  extends: .test_db
+  variables:
+    SERVICE_NAME: customer-db-access-service
+
+test:customer-bl-service:
+  extends: .test_bl
+  variables:
+    SERVICE_NAME: customer-bl-service
+
+test:job-db-access-service:
+  extends: .test_db
+  variables:
+    SERVICE_NAME: job-db-access-service
+
+test:job-bl-service:
+  extends: .test_bl
+  variables:
+    SERVICE_NAME: job-bl-service
+
+test:user-db-access-service:
+  extends: .test_db
+  variables:
+    SERVICE_NAME: user-db-access-service
+
+test:user-bl-service:
+  extends: .test_bl
+  variables:
+    SERVICE_NAME: user-bl-service
+
+test:frontend:
+  extends: .test_bl
+  variables:
+    SERVICE_NAME: frontend
+
+test:maps-access-service:
+  extends: .test_bl
+  variables:
+    SERVICE_NAME: maps-access-service
+
+test:migration-runner:
+  extends: .test_scripts
+  variables:
+    SERVICE_NAME: migration-runner
+
+# =============================================================================
+# STAGE 1b: TRIVY CODE SCAN — filesystem/dependency scan (ALL branches)
+# =============================================================================
+# Scans Python dependencies (requirements.txt) and source code for known CVEs.
+# This catches vulnerable packages BEFORE Docker images are built.
+#
+# Decision: CRITICAL severity only blocks the pipeline. HIGH is reported in
+# the JSON artifact but doesn't fail the build. This avoids false-positive
+# fatigue while catching genuinely dangerous vulnerabilities.
+#
+# Tool: Trivy (https://trivy.dev/) — open source, no API limits, offline CVE DB.
+
+trivy-code-scan:
+  stage: test
+  needs: []
+  image:
+    name: ${IMG_PFX}aquasec/trivy:latest
+    entrypoint: [""]
+  before_script: []  # Override default — Trivy doesn't need pip
+  script:
+    - |
+      echo "========================================="
+      echo "Scanning filesystem for CRITICAL vulnerabilities"
+      echo "========================================="
+
+      if trivy fs \
+        --severity CRITICAL \
+        --exit-code 1 \
+        --format table \
+        ./services/; then
+
+        # Produce full report artifact (HIGH + CRITICAL for informational purposes)
+        trivy fs --severity HIGH,CRITICAL --exit-code 0 --format json --output trivy-code-report.json ./services/
+
+        echo ""
+        echo "========================================="
+        echo "TRIVY CODE SCAN SUMMARY"
+        echo "========================================="
+        echo "✅ No CRITICAL vulnerabilities found in dependencies or source code"
+        echo ""
+        echo "Scan scope:"
+        echo "  ✓ Python dependencies (requirements.txt)"
+        echo "  ✓ Source code patterns"
+        echo "  ✓ CRITICAL severity = pipeline gate"
+        echo "  ✓ HIGH severity = reported in artifact only"
+      else
+        # Still produce the full report even on failure
+        trivy fs --severity HIGH,CRITICAL --exit-code 0 --format json --output trivy-code-report.json ./services/ || true
+
+        echo ""
+        echo "========================================="
+        echo "TRIVY CODE SCAN SUMMARY"
+        echo "========================================="
+        echo "❌ CRITICAL vulnerabilities found in dependencies or source code"
+        echo ""
+        echo "ACTION REQUIRED:"
+        echo "  1. Review the scan output above for vulnerable packages"
+        echo "  2. Update requirements.txt files to use patched versions"
+        echo "  3. Download trivy-code-report.json artifact for full details"
+        echo ""
+        exit 1
+      fi
+  artifacts:
+    paths:
+      - trivy-code-report.json
+    expire_in: 1 week
+    when: always
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# =============================================================================
+# STAGE 1c: BANDIT SECURITY SCAN — Python SAST (ALL branches)
+# =============================================================================
+# Bandit is a Python-specific static application security testing (SAST) tool.
+# It finds common security issues in Python code that general-purpose scanners
+# miss, such as:
+#   - SQL injection via string formatting
+#   - Use of eval() / exec()
+#   - Insecure subprocess calls (shell=True)
+#   - Weak cryptographic algorithms (MD5, SHA1)
+#   - Hardcoded passwords and secrets in source code
+#   - Insecure temporary file creation
+#
+# Why Bandit alongside Trivy?
+#   Trivy scans DEPENDENCIES for known CVEs (SCA).
+#   Bandit scans YOUR CODE for insecure patterns (SAST).
+#   They complement each other — different tools, different focus.
+#
+# Why Bandit alongside Aikido?
+#   Aikido's SAST is a black-box service with API rate limits.
+#   Bandit is open source, runs locally, no limits, and specialises in Python.
+#   Aikido may miss Python-specific patterns that Bandit catches.
+#
+# Gate: HIGH + CRITICAL severity, medium+ confidence.
+#       This avoids noise from low-confidence or low-severity findings.
+
+bandit-scan:
+  stage: test
+  needs: []
+  script:
+    - pip install "bandit[toml]>=1.7.0"
+    - |
+      echo "========================================="
+      echo "Running Bandit Python security analysis"
+      echo "========================================="
+      echo ""
+
+      # Run Bandit with HIGH+CRITICAL severity, medium confidence
+      # -r = recursive, -ll = HIGH+CRITICAL only, -ii = medium+ confidence
+      # Exclude test directories (they intentionally use patterns Bandit flags)
+      bandit -r services/ \
+        -ll -ii \
+        --exclude "*/tests/*,*/test_*,*/conftest.py" \
+        -f json -o bandit-report.json 2>&1 || true
+
+      # Parse results from JSON for formatted summary
+      ISSUE_COUNT=$(python3 -c "
+      import json, sys
+      try:
+          data = json.load(open('bandit-report.json'))
+          results = data.get('results', [])
+          print(len(results))
+      except:
+          print('0')
+      ")
+
+      FILES_SCANNED=$(python3 -c "
+      import json
+      try:
+          data = json.load(open('bandit-report.json'))
+          metrics = data.get('metrics', {})
+          total = metrics.get('_totals', {})
+          print(total.get('loc', 'unknown'))
+      except:
+          print('unknown')
+      ")
+
+      echo ""
+      echo "========================================="
+      echo "BANDIT SECURITY SCAN SUMMARY"
+      echo "========================================="
+
+      if [ "$ISSUE_COUNT" -eq 0 ] 2>/dev/null || [ "$ISSUE_COUNT" = "0" ]; then
+        echo "✅ No HIGH/CRITICAL security issues found in Python source"
+        echo ""
+        echo "Lines of code scanned: $FILES_SCANNED"
+        echo ""
+        echo "Checks performed:"
+        echo "  ✓ SQL injection patterns"
+        echo "  ✓ Command injection (subprocess, os.system)"
+        echo "  ✓ Insecure cryptography (MD5, SHA1, DES)"
+        echo "  ✓ Hardcoded credentials in source code"
+        echo "  ✓ Unsafe deserialization (pickle, yaml.load)"
+        echo "  ✓ Insecure temp file creation"
+        echo "  ✓ eval()/exec() usage"
+      else
+        echo "❌ $ISSUE_COUNT security issue(s) found in Python source"
+        echo ""
+
+        # Print per-file breakdown
+        python3 -c "
+      import json
+      data = json.load(open('bandit-report.json'))
+      results = data.get('results', [])
+      by_file = {}
+      for r in results:
+          f = r['filename']
+          if f not in by_file:
+              by_file[f] = []
+          by_file[f].append(r)
+
+      for fname, issues in sorted(by_file.items()):
+          print(f'  ✗ {fname}')
+          for issue in issues:
+              sev = issue.get('issue_severity', 'UNKNOWN')
+              text = issue.get('issue_text', 'No description')
+              line = issue.get('line_number', '?')
+              print(f'    └─ [{sev}] Line {line}: {text}')
+      "
+
+        echo ""
+        echo "ACTION REQUIRED:"
+        echo "  1. Review the issues listed above"
+        echo "  2. Fix security vulnerabilities in your code"
+        echo "  3. Download bandit-report.json artifact for full details"
+        echo "  4. If a finding is a false positive, add a '# nosec' comment"
+        echo ""
+        exit 1
+      fi
+  artifacts:
+    paths:
+      - bandit-report.json
+    expire_in: 1 week
+    when: always
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# =============================================================================
+# STAGE 1d: GITLEAKS SECRET SCAN — credential detection (ALL branches)
+# =============================================================================
+# Gitleaks scans the git repository for accidentally committed secrets,
+# API keys, passwords, tokens, and other credentials.
+#
+# Why Gitleaks?
+#   - Open source, no API limits, runs locally
+#   - Scans the entire git history (not just current files)
+#   - Catches secrets that were committed and then "deleted" (still in history)
+#   - Runs on ALL branches (Aikido only scans secrets on main)
+#
+# Why alongside Aikido?
+#   Aikido's secret scanning only runs on main branch (to conserve API quota).
+#   Feature branches currently have ZERO secret scanning without Gitleaks.
+#   A developer could accidentally commit an API key to a feature branch,
+#   merge it, and only discover it when Aikido scans main — too late.
+#
+# Configuration: ci/.gitleaks.toml allowlists known
+# test/CI secrets (e.g., ci-test-secret-key-not-for-production).
+
+gitleaks-scan:
+  stage: test
+  needs: []
+  image:
+    name: ${IMG_PFX}zricethezav/gitleaks:latest
+    entrypoint: [""]
+  before_script: []  # Override default — Gitleaks doesn't need pip
+  variables:
+    GIT_DEPTH: "0"  # Full clone needed to scan entire git history
+  script:
+    - |
+      echo "========================================="
+      echo "Scanning repository for leaked secrets"
+      echo "========================================="
+      echo ""
+
+      # Run Gitleaks with JSON report output
+      # --source . scans the current checkout
+      # --config uses ci/.gitleaks.toml for allowlisting known test secrets
+      if gitleaks detect \
+        --source . \
+        --config ci/.gitleaks.toml \
+        --report-format json \
+        --report-path gitleaks-report.json \
+        --verbose 2>&1; then
+
+        echo ""
+        echo "========================================="
+        echo "GITLEAKS SECRET SCAN SUMMARY"
+        echo "========================================="
+        echo "✅ No secrets or credentials detected in repository"
+        echo ""
+        echo "Scan scope:"
+        echo "  ✓ Full git history (all commits)"
+        echo "  ✓ All file types"
+        echo "  ✓ Known test secrets allowlisted via ci/.gitleaks.toml"
+      else
+        # Count findings from report
+        FINDING_COUNT=$(cat gitleaks-report.json 2>/dev/null | grep -c '"RuleID"' || echo "0")
+
+        echo ""
+        echo "========================================="
+        echo "GITLEAKS SECRET SCAN SUMMARY"
+        echo "========================================="
+        echo "❌ $FINDING_COUNT potential secret(s)/credential(s) detected"
+        echo ""
+
+        # Print per-finding summary (redact actual secret values)
+        cat gitleaks-report.json 2>/dev/null | \
+          grep -E '"(RuleID|File|StartLine|Description)"' | \
+          sed 's/.*"RuleID": "\([^"]*\)".*/  ✗ Rule: \1/' | \
+          sed 's/.*"File": "\([^"]*\)".*/    File: \1/' | \
+          sed 's/.*"StartLine": \([0-9]*\).*/    Line: \1/' | \
+          sed 's/.*"Description": "\([^"]*\)".*/    Type: \1/' || true
+
+        echo ""
+        echo "ACTION REQUIRED:"
+        echo "  1. Review the findings above — secrets in git history are permanent"
+        echo "  2. ROTATE any real credentials immediately"
+        echo "  3. If false positive, add pattern to ci/.gitleaks.toml allowlist"
+        echo "  4. Download gitleaks-report.json artifact for full details"
+        echo "  5. Consider using git-filter-repo to remove secrets from history"
+        echo ""
+        exit 1
+      fi
+  artifacts:
+    paths:
+      - gitleaks-report.json
+    expire_in: 1 week
+    when: always
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# =============================================================================
+# STAGE 3: INTEGRATION TESTS — Docker Compose full-stack tests (ALL branches)
+# =============================================================================
+# Spins up the entire application stack (all 11 services + Postgres + Redis)
+# by building images locally from Dockerfiles. Tests hit real endpoints
+# through NGINX.
+#
+# Decision: Runs on ALL branches for comprehensive testing. Feature branches
+# get lint + unit tests + security scans + integration tests.
+# Images are built locally using `docker compose up --build` with BuildKit
+# enabled for parallel layer builds.
+#
+# Optimization:
+#   - DOCKER_BUILDKIT=1 enables parallel multi-stage builds
+#   - COMPOSE_PARALLEL_LIMIT=10 builds all services concurrently
+#   - Registry cache pull for faster rebuilds
+#
+# Test types:
+#   1. Pairwise — tests specific service pairs (e.g., job-bl ↔ job-db-access)
+#   2. E2E Smoke — full business path through ALL layers
+
+# =============================================================================
+# Branch behavior
+# =============================================================================
+# Spins up the entire application stack (all 11 services + Postgres + Redis)
+# and runs integration tests through NGINX.
+#
+# On MAIN branch:
+#   - Pulls pre-built RC images from the build-scan stage (no local build)
+#   - Tests the exact images that will be pushed to the registry
+#   - needs: [build-scan] ensures images exist before testing
+#
+# On FEATURE branches:
+#   - Builds images locally using `docker compose up --build`
+#   - No registry involved (build stage only runs on main)
+#
+# Test types:
+#   1. Pairwise — tests specific service pairs (e.g., job-bl ↔ job-db-access)
+#   2. E2E Smoke — full business path through ALL layers
+
+# --- Feature branch integration tests (local build) ---
+integration-tests:
+  stage: integration
+  image: ${IMG_PFX}docker:27
+  services:
+    - name: ${IMG_PFX}docker:27-dind
+      alias: docker
+      command: ["--tls=false"]
+  needs: []
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_BUILDKIT: "1"
+    COMPOSE_DOCKER_CLI_BUILD: "1"
+    COMPOSE_PARALLEL_LIMIT: "10"
+    BUILDKIT_PROGRESS: "plain"
+  before_script:
+    # Clean up any leftover containers/volumes from previous runs
+    - |
+      echo "🧹 Cleaning up stale containers/volumes..."
+      docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml down -v --remove-orphans 2>/dev/null || true
+      docker image prune -f 2>/dev/null || true
+      # Give the system a moment to release ports
+      sleep 2
+  script:
+    # Auto-detect Docker endpoint (host socket vs DinD service)
+    - |
+      if docker info >/dev/null 2>&1; then
+        echo "✅ Docker available via default socket"
+      else
+        echo "Socket not available, waiting for DinD on tcp://docker:2375..."
+        export DOCKER_HOST=tcp://docker:2375
+        for i in $(seq 1 15); do
+          if docker info >/dev/null 2>&1; then break; fi
+          sleep 2
+        done
+        if docker info >/dev/null 2>&1; then
+          echo "✅ Docker available via DinD (tcp://docker:2375)"
+        else
+          echo "❌ Cannot connect to any Docker daemon"
+          exit 1
+        fi
+      fi
+
+    - docker compose version
+
+    # Authenticate to Docker Hub for base image pulls (avoids rate limits)
+    - |
+      if [ -n "$DOCKERHUB_USER" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+        if echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin 2>/dev/null; then
+          echo "✅ Authenticated to Docker Hub (200 pulls/6h)"
+        else
+          echo "⚠️  Docker Hub login failed (network issue?) — continuing with cached images"
+        fi
+      else
+        echo "⚠️  DOCKERHUB_USER/DOCKERHUB_TOKEN not set — using unauthenticated pulls (100/6h)"
+      fi
+
+    # Pull cached images for faster local builds
+    - |
+      # Bake seed file into migration-runner image (volume mounts fail on socket runners)
+      cp scripts/seed-demo-data.sql services/migration-runner/ 2>/dev/null || true
+
+      echo "Pulling cached images from registry..."
+      SERVICES="nginx auth-service user-db-access-service customer-db-access-service \
+        job-db-access-service user-bl-service job-bl-service customer-bl-service \
+        admin-bl-service maps-access-service notification-service frontend"
+
+      for SERVICE in $SERVICES; do
+        docker pull "$IMAGE_TAG:$SERVICE-latest" 2>/dev/null || echo "  ⚠️  No cached image for $SERVICE (first build)"
+      done
+
+    # Build and start the full stack locally
+    - >
+      docker compose
+      -f docker-compose.yml
+      -f ci/docker-compose.ci.yml
+      up --build -d
+
+    - >
+      docker compose
+      -f docker-compose.yml
+      -f ci/docker-compose.ci.yml
+      wait integration-runner
+
+  after_script:
+    # Extract test results even if containers fail
+    - docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml cp integration-runner:/tests/results/integration-junit.xml ./integration-junit.xml || echo "⚠️  Could not copy test results"
+    - docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml logs integration-runner 2>&1 | tail -80 | head -80 || true
+    - docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml logs --tail=100 > integration-logs.txt 2>&1 || true
+    - |
+      echo ""
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  INTEGRATION TEST SUMMARY"
+      echo "═══════════════════════════════════════════════════════════════"
+      if [ -f integration-junit.xml ]; then
+        TESTS=$(grep -o 'tests="[0-9]*"' integration-junit.xml | head -1 | grep -o '[0-9]*')
+        FAILURES=$(grep -o 'failures="[0-9]*"' integration-junit.xml | head -1 | grep -o '[0-9]*')
+        ERRORS=$(grep -o 'errors="[0-9]*"' integration-junit.xml | head -1 | grep -o '[0-9]*')
+        TIME=$(grep -o 'time="[0-9.]*"' integration-junit.xml | head -1 | grep -o '[0-9.]*')
+        PASSED=$((TESTS - FAILURES - ERRORS))
+        echo "  Total: $TESTS | ✅ Passed: $PASSED | ❌ Failed: $FAILURES | ⚠️  Errors: $ERRORS | ⏱  ${TIME}s"
+        echo "═══════════════════════════════════════════════════════════════"
+        if [ "$FAILURES" != "0" ] || [ "$ERRORS" != "0" ]; then
+          echo ""
+          echo "  FAILED TESTS:"
+          grep '<testcase' integration-junit.xml | grep -B0 -A0 '<failure\|<error' | sed 's/.*name="\([^"]*\)".*/    ✗ \1/' || true
+          # Fallback: show failure messages directly
+          grep -A2 '<failure' integration-junit.xml | grep 'message=' | sed 's/.*message="\([^"]*\)".*/    → \1/' | head -20 || true
+          echo "═══════════════════════════════════════════════════════════════"
+        fi
+      else
+        echo "  ⚠️  No JUnit XML found — integration runner may have crashed"
+        echo "  Check integration-logs.txt artifact for details"
+        echo "═══════════════════════════════════════════════════════════════"
+      fi
+    - |
+      # Force cleanup of all containers/volumes to prevent port conflicts in subsequent runs
+      docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml down -v --remove-orphans 2>/dev/null || true
+      docker image prune -f 2>/dev/null || true
+      echo "✅ Cleanup complete"
+  artifacts:
+    paths:
+      - integration-logs.txt
+      - integration-junit.xml
+    reports:
+      junit: integration-junit.xml
+    expire_in: 3 days
+    when: always
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != "main"
+
+# --- Main branch integration tests (use pre-built RC images) ---
+integration-tests-main:
+  stage: integration
+  image: ${IMG_PFX}docker:27
+  services:
+    - name: ${IMG_PFX}docker:27-dind
+      alias: docker
+      command: ["--tls=false"]
+  needs:
+    - build-scan
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    BUILDKIT_PROGRESS: "plain"
+  before_script:
+    # Clean up any leftover containers/volumes from previous runs
+    - |
+      echo "🧹 Cleaning up stale containers/volumes..."
+      docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml down -v --remove-orphans 2>/dev/null || true
+      docker image prune -f 2>/dev/null || true
+      # Give the system a moment to release ports
+      sleep 2
+  script:
+    # Auto-detect Docker endpoint (host socket vs DinD service)
+    - |
+      if docker info >/dev/null 2>&1; then
+        echo "✅ Docker available via default socket"
+      else
+        echo "Socket not available, waiting for DinD on tcp://docker:2375..."
+        export DOCKER_HOST=tcp://docker:2375
+        for i in $(seq 1 15); do
+          if docker info >/dev/null 2>&1; then break; fi
+          sleep 2
+        done
+        if docker info >/dev/null 2>&1; then
+          echo "✅ Docker available via DinD (tcp://docker:2375)"
+        else
+          echo "❌ Cannot connect to any Docker daemon"
+          exit 1
+        fi
+      fi
+
+    - docker compose version
+
+    # Authenticate to Docker Hub for base image pulls (avoids rate limits)
+    - |
+      if [ -n "$DOCKERHUB_USER" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+        if echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin 2>/dev/null; then
+          echo "✅ Authenticated to Docker Hub (200 pulls/6h)"
+        else
+          echo "⚠️  Docker Hub login failed (network issue?) — continuing with cached images"
+        fi
+      else
+        echo "⚠️  DOCKERHUB_USER/DOCKERHUB_TOKEN not set — using unauthenticated pulls (100/6h)"
+      fi
+
+    # Pull the RC images that were built+scanned in the build-scan stage
+    - |
+      # Bake seed file into migration-runner image (volume mounts fail on socket runners)
+      cp scripts/seed-demo-data.sql services/migration-runner/ 2>/dev/null || true
+
+      echo "========================================="
+      echo "Pulling RC images from build-scan stage..."
+      echo "========================================="
+      SERVICES="nginx auth-service user-db-access-service customer-db-access-service \
+        job-db-access-service user-bl-service job-bl-service customer-bl-service \
+        admin-bl-service maps-access-service notification-service frontend"
+
+      for SERVICE in $SERVICES; do
+        echo "Pulling: $IMAGE_TAG:$SERVICE-rc"
+        docker pull "$IMAGE_TAG:$SERVICE-rc"
+      done
+      echo ""
+      echo "✅ All RC images pulled"
+
+    # Rebuild services that are NOT pre-built RC images.
+    # Without --build on `up`, the socket runner reuses stale cached images.
+    #   • migration-runner  — needs fresh seed file baked in
+    #   • nginx-gateway     — needs nginx-ci.conf (includes server_name nginx-gateway)
+    #   • integration-runner — must use latest test code
+    - >
+      docker compose
+      -f docker-compose.yml
+      -f ci/docker-compose.ci.yml
+      build migration-runner nginx-gateway
+
+    - >
+      docker compose
+      -f docker-compose.yml
+      -f ci/docker-compose.ci.yml
+      build --no-cache integration-runner
+
+    # Start the stack using pre-built images (no --build flag).
+    # The prebuilt overlay maps each service → its RC image so Compose
+    # uses the pulled images instead of rebuilding from Dockerfiles.
+    - >
+      docker compose
+      -f docker-compose.yml
+      -f ci/docker-compose.ci.yml
+      -f ci/docker-compose.prebuilt.yml
+      up -d
+
+    - >
+      docker compose
+      -f docker-compose.yml
+      -f ci/docker-compose.ci.yml
+      -f ci/docker-compose.prebuilt.yml
+      wait integration-runner
+
+  after_script:
+    - docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml -f ci/docker-compose.prebuilt.yml cp integration-runner:/tests/results/integration-junit.xml ./integration-junit.xml || echo "⚠️  Could not copy test results"
+    - docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml -f ci/docker-compose.prebuilt.yml logs integration-runner 2>&1 | tail -80 | head -80 || true
+    - docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml -f ci/docker-compose.prebuilt.yml logs --tail=100 > integration-logs.txt 2>&1 || true
+    - |
+      echo ""
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  INTEGRATION TEST SUMMARY"
+      echo "═══════════════════════════════════════════════════════════════"
+      if [ -f integration-junit.xml ]; then
+        TESTS=$(grep -o 'tests="[0-9]*"' integration-junit.xml | head -1 | grep -o '[0-9]*')
+        FAILURES=$(grep -o 'failures="[0-9]*"' integration-junit.xml | head -1 | grep -o '[0-9]*')
+        ERRORS=$(grep -o 'errors="[0-9]*"' integration-junit.xml | head -1 | grep -o '[0-9]*')
+        TIME=$(grep -o 'time="[0-9.]*"' integration-junit.xml | head -1 | grep -o '[0-9.]*')
+        PASSED=$((TESTS - FAILURES - ERRORS))
+        echo "  Total: $TESTS | ✅ Passed: $PASSED | ❌ Failed: $FAILURES | ⚠️  Errors: $ERRORS | ⏱  ${TIME}s"
+        echo "═══════════════════════════════════════════════════════════════"
+        if [ "$FAILURES" != "0" ] || [ "$ERRORS" != "0" ]; then
+          echo ""
+          echo "  FAILED TESTS:"
+          grep '<testcase' integration-junit.xml | grep -B0 -A0 '<failure\|<error' | sed 's/.*name="\([^"]*\)".*/    ✗ \1/' || true
+          # Fallback: show failure messages directly
+          grep -A2 '<failure' integration-junit.xml | grep 'message=' | sed 's/.*message="\([^"]*\)".*/    → \1/' | head -20 || true
+          echo "═══════════════════════════════════════════════════════════════"
+        fi
+      else
+        echo "  ⚠️  No JUnit XML found — integration runner may have crashed"
+        echo "  Check integration-logs.txt artifact for details"
+        echo "═══════════════════════════════════════════════════════════════"
+      fi
+    - |
+      # Force cleanup of all containers/volumes to prevent port conflicts in subsequent runs
+      docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml -f ci/docker-compose.prebuilt.yml down -v --remove-orphans 2>/dev/null || true
+      docker image prune -f 2>/dev/null || true
+      echo "✅ Cleanup complete"
+  artifacts:
+    paths:
+      - integration-logs.txt
+      - integration-junit.xml
+    reports:
+      junit: integration-junit.xml
+    expire_in: 3 days
+    when: always
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 4: CODE QUALITY — SonarCloud analysis (main only, INFORMATIONAL)
+# =============================================================================
+# SonarCloud provides a dashboard for code quality trends: bugs, code smells,
+# duplication, and test coverage over time. It consumes coverage.xml artifacts
+# from the unit test stage.
+#
+# IMPORTANT: This job is set to allow_failure: true (SOFT GATE).
+# SonarCloud is kept for its dashboard and trend analysis, NOT as a pipeline
+# gate. The actual code quality gate is Ruff (lint stage) which is open source,
+# has no API limits, and runs on every branch.
+#
+# Why soft-fail?
+#   - SonarCloud free tier has scan limits that can exhaust mid-pipeline
+#   - Quota exhaustion causes spurious pipeline failures unrelated to code
+#   - Ruff already enforces code quality rules as a hard gate
+#   - SonarCloud's value is in its dashboard, not as a gate
+#
+# Prerequisites:
+#   - SONAR_TOKEN set in GitLab CI/CD variables (masked)
+
+sonarcloud-analysis:
+  stage: quality
+  needs:
+    - test:auth-service
+    - test:admin-bl-service
+    - test:customer-db-access-service
+    - test:customer-bl-service
+    - test:job-db-access-service
+    - test:job-bl-service
+    - test:user-db-access-service
+    - test:user-bl-service
+    - test:frontend
+    - test:maps-access-service
+    - test:migration-runner
+  image:
+    name: ${IMG_PFX}sonarsource/sonar-scanner-cli:11
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"  # Full clone needed for blame/history analysis
+  cache:
+    policy: pull-push
+    key: "sonar-cache-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "${SONAR_USER_HOME}/cache"
+      - sonar-scanner/
+  before_script: []  # Override default pip install
+  script:
+    - |
+      echo "========================================="
+      echo "Running SonarCloud analysis (informational)"
+      echo "========================================="
+      echo ""
+      echo "ℹ️  This job is informational only — it does not block the pipeline."
+      echo "    Open source tools (Ruff, Bandit, Trivy) are the hard gates."
+      echo ""
+
+    - sonar-scanner -Dproject.settings=ci/sonar-project.properties || true
+
+    - |
+      echo ""
+      echo "========================================="
+      echo "SONARCLOUD ANALYSIS SUMMARY"
+      echo "========================================="
+      echo "ℹ️  SonarCloud analysis complete (informational — does not block pipeline)"
+      echo ""
+      echo "Dashboard: https://sonarcloud.io/project/overview?id=crm-calendar-microservices"
+      echo ""
+      echo "What SonarCloud tracks:"
+      echo "  • Bug detection and code smell analysis"
+      echo "  • Test coverage trends over time"
+      echo "  • Code duplication metrics"
+      echo "  • Technical debt estimation"
+      echo ""
+      echo "Pipeline gates are enforced by open source tools:"
+      echo "  ✓ Code quality  → Ruff (lint stage)"
+      echo "  ✓ Security SAST → Bandit (test stage)"
+      echo "  ✓ Dependency CVEs → Trivy (test + build stages)"
+      echo "  ✓ Secret detection → Gitleaks (test stage)"
+  allow_failure: true  # SOFT — dashboard only, never blocks pipeline
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 2: BUILD — build + scan images, push RC tags (main only)
+# =============================================================================
+# Builds all 11 service images, scans each with Trivy for OS-level and
+# application-layer vulnerabilities, and pushes "release candidate" (RC)
+# tags to the registry. The integration stage then pulls these RC images
+# to test them. Final tags are only pushed in the push stage AFTER
+# integration tests pass.
+#
+# Auto-detects Docker endpoint: uses host socket if mounted, otherwise
+# falls back to DinD service on tcp://docker:2375.
+#
+# Flow: build all → scan all → push RC tags
+# CRITICAL severity = pipeline fail (no push). HIGH = report artifact only.
+
+build-scan:
+  stage: build
+  image: ${IMG_PFX}docker:27
+  services:
+    - name: ${IMG_PFX}docker:27-dind
+      alias: docker
+      command: ["--tls=false"]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_BUILDKIT: "1"
+    BUILDKIT_PROGRESS: "plain"
+  before_script: []  # Override default — Docker job, not Python
+  script:
+    - |
+      if [ -f scripts/seed-demo-data.sql ]; then
+        cp scripts/seed-demo-data.sql services/migration-runner/
+        echo "✅ Copied seed-demo-data.sql into migration-runner build context"
+      else
+        echo "⚠️  scripts/seed-demo-data.sql not found; migration-runner image will be built without demo seed data"
+      fi
+
+    # Auto-detect Docker endpoint (host socket vs DinD service)
+    - |
+      if docker info >/dev/null 2>&1; then
+        echo "✅ Docker available via default socket"
+      else
+        echo "Socket not available, waiting for DinD on tcp://docker:2375..."
+        export DOCKER_HOST=tcp://docker:2375
+        for i in $(seq 1 15); do
+          if docker info >/dev/null 2>&1; then break; fi
+          sleep 2
+        done
+        if docker info >/dev/null 2>&1; then
+          echo "✅ Docker available via DinD (tcp://docker:2375)"
+        else
+          echo "❌ Cannot connect to any Docker daemon"
+          exit 1
+        fi
+      fi
+
+    # Authenticate to Docker Hub for base image pulls (avoids rate limits)
+    - |
+      if [ -n "$DOCKERHUB_USER" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+        if echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin 2>/dev/null; then
+          echo "✅ Authenticated to Docker Hub (200 pulls/6h)"
+        else
+          echo "⚠️  Docker Hub login failed (network issue?) — continuing with cached images"
+        fi
+      else
+        echo "⚠️  DOCKERHUB_USER/DOCKERHUB_TOKEN not set — using unauthenticated pulls (100/6h)"
+      fi
+
+    # Install Trivy for local image scanning
+    - apk add --no-cache curl
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+    # Build → Scan → Push RC (all in one block so $SERVICES is shared)
+    - |
+      SERVICES="nginx auth-service user-db-access-service customer-db-access-service \
+        job-db-access-service user-bl-service job-bl-service customer-bl-service \
+        admin-bl-service maps-access-service notification-service migration-runner frontend"
+
+      # ── Phase 0: PULL cached images for faster builds ──
+      echo "========================================="
+      echo "Pulling cached images from registry..."
+      echo "========================================="
+      for SERVICE in $SERVICES; do
+        if docker pull "$IMAGE_TAG:$SERVICE-latest" 2>/dev/null; then
+          echo "✓ Cached image pulled: $SERVICE"
+        else
+          echo "⚠️  No cached image for $SERVICE (first build or new service)"
+        fi
+      done
+      echo ""
+
+      # ── Phase 1: BUILD all images in parallel with BuildKit ──
+      echo "========================================="
+      echo "Building all images (parallel)..."
+      echo "========================================="
+
+      PIDS=""
+      for SERVICE in $SERVICES; do
+        (
+          echo "Building: $SERVICE"
+          docker build \
+            --pull \
+            --cache-from "$IMAGE_TAG:$SERVICE-latest" \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            -f services/$SERVICE/Dockerfile \
+            -t "$IMAGE_TAG:$SERVICE-$IMAGE_VERSION" \
+            -t "$IMAGE_TAG:$SERVICE-latest" \
+            -t "$IMAGE_TAG:$SERVICE-rc" \
+            services/ 2>&1 | sed "s/^/[$SERVICE] /"
+        ) &
+        PIDS="$PIDS $!"
+      done
+
+      BUILD_FAILED=0
+      for PID in $PIDS; do
+        if ! wait $PID; then
+          BUILD_FAILED=1
+        fi
+      done
+
+      if [ $BUILD_FAILED -eq 1 ]; then
+        echo "❌ One or more builds failed"
+        exit 1
+      fi
+
+      echo ""
+      echo "✅ All images built successfully"
+      echo ""
+
+      # ── Phase 2: SCAN all images with Trivy ──
+      SCAN_FAILED=0
+      FAILED_SERVICES=""
+      PASSED_SERVICES=""
+
+      for SERVICE in $SERVICES; do
+        echo "========================================="
+        echo "Scanning image: $SERVICE"
+        echo "========================================="
+
+        if trivy image \
+          --severity CRITICAL \
+          --exit-code 1 \
+          --ignore-unfixed \
+          --format table \
+          "$IMAGE_TAG:$SERVICE-$IMAGE_VERSION"; then
+          PASSED_SERVICES="$PASSED_SERVICES $SERVICE"
+        else
+          SCAN_FAILED=1
+          FAILED_SERVICES="$FAILED_SERVICES $SERVICE"
+        fi
+
+        trivy image \
+          --severity HIGH,CRITICAL \
+          --exit-code 0 \
+          --ignore-unfixed \
+          --format json \
+          --output "trivy-image-${SERVICE}.json" \
+          "$IMAGE_TAG:$SERVICE-$IMAGE_VERSION"
+      done
+
+      # ── SUMMARY (always at the bottom) ──
+      echo ""
+      echo "========================================="
+      echo "TRIVY IMAGE SCAN SUMMARY"
+      echo "========================================="
+
+      if [ "$SCAN_FAILED" -eq 0 ]; then
+        echo "✅ All images passed security scan (no CRITICAL vulnerabilities)"
+        echo ""
+        echo "Clean images (11):"
+        for SERVICE in $SERVICES; do
+          echo "  ✓ $SERVICE"
+        done
+      else
+        echo "❌ CRITICAL vulnerabilities found in one or more images"
+        echo ""
+
+        if [ -n "$PASSED_SERVICES" ]; then
+          PASS_COUNT=$(echo $PASSED_SERVICES | wc -w)
+          echo "✅ Clean images ($PASS_COUNT):"
+          for SERVICE in $PASSED_SERVICES; do
+            echo "  ✓ $SERVICE"
+          done
+          echo ""
+        fi
+
+        FAIL_COUNT=$(echo $FAILED_SERVICES | wc -w)
+        echo "❌ Images with CRITICAL vulnerabilities ($FAIL_COUNT):"
+        for SERVICE in $FAILED_SERVICES; do
+          echo "  ✗ $SERVICE"
+
+          VULN_COUNT=$(cat "trivy-image-${SERVICE}.json" | \
+            grep -o '"Severity":"CRITICAL"' | wc -l)
+
+          if [ "$VULN_COUNT" -gt 0 ]; then
+            echo "    └─ $VULN_COUNT CRITICAL vulnerabilities found"
+
+            cat "trivy-image-${SERVICE}.json" | \
+              grep -A 5 '"Severity":"CRITICAL"' | \
+              grep '"VulnerabilityID"' | \
+              head -3 | \
+              sed 's/.*"VulnerabilityID":"\([^"]*\)".*/       • \1/'
+          fi
+        done
+
+        echo ""
+        echo "ACTION REQUIRED:"
+        echo "  1. Review the scan output above for details"
+        echo "  2. Update Dockerfiles to fix vulnerable packages"
+        echo "  3. Download trivy-image-*.json artifacts for full reports"
+        echo ""
+        echo "Images will NOT be pushed to the registry until vulnerabilities are resolved."
+        exit 1
+      fi
+
+      # ── Phase 3: PUSH RC tags (release candidates for integration testing) ──
+      echo ""
+      echo "========================================="
+      echo "Authenticating to container registry"
+      echo "========================================="
+      echo "Registry: ${CI_REGISTRY:-registry.gitlab.com}"
+      echo "User: $CI_REGISTRY_USER"
+
+      if [ -z "$CI_REGISTRY" ]; then
+        echo "⚠️  CI_REGISTRY not set, using Docker Hub"
+        echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin
+      else
+        echo "Using GitLab Container Registry: $CI_REGISTRY"
+        echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+      fi
+
+      if [ $? -ne 0 ]; then
+        echo ""
+        echo "❌ Docker login failed!"
+        echo ""
+        echo "TROUBLESHOOTING:"
+        echo "  • Verify CI/CD variables are set in GitLab project settings:"
+        echo "    - CI_REGISTRY_USER (auto-provided by GitLab)"
+        echo "    - CI_REGISTRY_PASSWORD (auto-provided by GitLab)"
+        echo "  • For Docker Hub, manually set:"
+        echo "    - CI_REGISTRY_USER = your Docker Hub username"
+        echo "    - CI_REGISTRY_PASSWORD = your Docker Hub access token"
+        echo "    - CI_REGISTRY_IMAGE = username/repository"
+        echo "  • Check that Deploy Tokens or Personal Access Tokens have write access"
+        exit 1
+      fi
+
+      echo "✅ Authentication successful"
+      echo ""
+
+      echo "========================================="
+      echo "Pushing RC (release candidate) tags..."
+      echo "========================================="
+      for SERVICE in $SERVICES; do
+        if docker push "$IMAGE_TAG:$SERVICE-rc"; then
+          echo "✅ Pushed $SERVICE-rc"
+        else
+          echo "❌ Failed to push $SERVICE-rc"
+          exit 1
+        fi
+      done
+
+      echo ""
+      echo "========================================="
+      echo "✅ All RC images pushed — ready for integration testing"
+      echo "========================================="
+  artifacts:
+    paths:
+      - trivy-image-*.json
+    expire_in: 1 week
+    when: always
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 5: PUSH — re-tag RC → final + latest, push to registry (main only)
+# =============================================================================
+# Only runs AFTER integration tests pass on main. Pulls the RC images that
+# were already built, scanned, and integration-tested, then re-tags them
+# with the final version tag and 'latest' before pushing to the registry.
+#
+# This ensures only tested, scanned images reach the registry.
+
+push-images:
+  stage: push
+  image: ${IMG_PFX}docker:27
+  services:
+    - name: ${IMG_PFX}docker:27-dind
+      alias: docker
+      command: ["--tls=false"]
+  needs:
+    - build-scan
+    - integration-tests-main
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  before_script: []
+  script:
+    # Auto-detect Docker endpoint (host socket vs DinD service)
+    - |
+      if docker info >/dev/null 2>&1; then
+        echo "✅ Docker available via default socket"
+      else
+        echo "Socket not available, waiting for DinD on tcp://docker:2375..."
+        export DOCKER_HOST=tcp://docker:2375
+        for i in $(seq 1 15); do
+          if docker info >/dev/null 2>&1; then break; fi
+          sleep 2
+        done
+        if docker info >/dev/null 2>&1; then
+          echo "✅ Docker available via DinD (tcp://docker:2375)"
+        else
+          echo "❌ Cannot connect to any Docker daemon"
+          exit 1
+        fi
+      fi
+
+    - |
+      SERVICES="nginx auth-service user-db-access-service customer-db-access-service \
+        job-db-access-service user-bl-service job-bl-service customer-bl-service \
+        admin-bl-service maps-access-service notification-service migration-runner frontend"
+
+      # ── Authenticate to registry ──
+      echo "========================================="
+      echo "Authenticating to container registry"
+      echo "========================================="
+
+      if [ -z "$CI_REGISTRY" ]; then
+        echo "⚠️  CI_REGISTRY not set, using Docker Hub"
+        echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin
+      else
+        echo "Using GitLab Container Registry: $CI_REGISTRY"
+        echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+      fi
+
+      if [ $? -ne 0 ]; then
+        echo "❌ Docker login failed!"
+        exit 1
+      fi
+
+      echo "✅ Authentication successful"
+      echo ""
+
+      # ── Pull RC images, re-tag, and push final tags ──
+      echo "========================================="
+      echo "Re-tagging RC → final version + latest"
+      echo "========================================="
+
+      for SERVICE in $SERVICES; do
+        echo ""
+        echo "── $SERVICE ──"
+
+        # Pull the RC image
+        docker pull "$IMAGE_TAG:$SERVICE-rc"
+
+        # Tag with version and latest
+        docker tag "$IMAGE_TAG:$SERVICE-rc" "$IMAGE_TAG:$SERVICE-$IMAGE_VERSION"
+        docker tag "$IMAGE_TAG:$SERVICE-rc" "$IMAGE_TAG:$SERVICE-latest"
+
+        # Push final tags
+        if docker push "$IMAGE_TAG:$SERVICE-$IMAGE_VERSION"; then
+          echo "✅ Pushed $SERVICE-$IMAGE_VERSION"
+        else
+          echo "❌ Failed to push $SERVICE-$IMAGE_VERSION"
+          exit 1
+        fi
+
+        if docker push "$IMAGE_TAG:$SERVICE-latest"; then
+          echo "✅ Pushed $SERVICE-latest"
+        else
+          echo "❌ Failed to push $SERVICE-latest"
+          exit 1
+        fi
+      done
+
+      echo ""
+      echo "========================================="
+      echo "✅ All images pushed successfully"
+      echo "========================================="
+      echo ""
+      echo "Images are integration-tested, security-scanned, and ready for deployment."
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 6: AIKIDO RELEASE GATE — security dashboard (main only, INFORMATIONAL)
+# =============================================================================
+# Aikido provides a security dashboard with SAST, SCA, secrets detection,
+# IaC scanning, and continuous post-deploy CVE monitoring.
+#
+# IMPORTANT: This job is set to allow_failure: true (SOFT GATE).
+# Aikido is kept for its dashboard, continuous monitoring, and the additional
+# context it provides alongside the open source tools. It does NOT block
+# the pipeline — open source tools (Bandit, Gitleaks, Trivy) are the hard gates.
+#
+# Why soft-fail?
+#   - Aikido free tier has limited API quota (scans per month)
+#   - Quota exhaustion causes spurious pipeline failures
+#   - All security concerns Aikido checks are already covered by FOSS tools:
+#       SAST         → Bandit (hard gate in test stage)
+#       SCA          → Trivy (hard gate in test + build stages)
+#       Secrets      → Gitleaks (hard gate in test stage)
+#       IaC scanning → Trivy (checks Dockerfiles/Compose)
+#   - Aikido's unique value is its dashboard and continuous monitoring post-deploy
+#
+# NOTE: Using 'scan' instead of 'scan-release' for free tier compatibility.
+
+aikido-release-gate:
+  stage: release
+  image: ${IMG_PFX}node:22
+  needs:
+    - push-images
+    - integration-tests-main
+  before_script: []  # Override default — Node job, not Python
+  script:
+    - npm install --global @aikidosec/ci-api-client
+    - |
+      echo "========================================="
+      echo "Running Aikido security scan (informational)"
+      echo "========================================="
+      echo ""
+      echo "ℹ️  This job is informational only — it does not block the pipeline."
+      echo "    Open source tools (Bandit, Gitleaks, Trivy) are the hard gates."
+      echo ""
+
+    - |
+      # Use 'scan' instead of 'scan-release' for free tier
+      aikido-api-client scan \
+        --apikey "$AIKIDO_CLIENT_API_KEY" \
+        --fail-on-sast \
+        --fail-on-dependencies \
+        --fail-on-secrets \
+        --fail-on-iac || true
+
+    - |
+      echo ""
+      echo "========================================="
+      echo "AIKIDO SECURITY SCAN SUMMARY"
+      echo "========================================="
+      echo "ℹ️  Aikido scan complete (informational — does not block pipeline)"
+      echo ""
+      echo "Dashboard: https://app.aikido.dev"
+      echo ""
+      echo "What Aikido tracks:"
+      echo "  • SAST (code vulnerability patterns)"
+      echo "  • SCA (dependency CVEs — different DB than Trivy)"
+      echo "  • Secrets detection"
+      echo "  • IaC misconfiguration (Dockerfiles, Compose)"
+      echo "  • License compliance"
+      echo "  • Continuous post-deploy CVE monitoring"
+      echo ""
+      echo "Pipeline gates are enforced by open source tools:"
+      echo "  ✓ Python SAST     → Bandit (test stage)"
+      echo "  ✓ Dependency CVEs → Trivy (test + build stages)"
+      echo "  ✓ Secrets         → Gitleaks (test stage)"
+      echo "  ✓ Container CVEs  → Trivy image scan (build stage)"
+  allow_failure: true  # SOFT — dashboard only, never blocks pipeline
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# =============================================================================
+# STAGE 7: DEPLOY — trigger deployment repo (main only)
+# =============================================================================
+# After all tests and scans pass, trigger the deployment repository pipeline.
+# Automatic — fires as soon as images are built and integration tests pass.
+# The deployment repo has its own manual gate before spinning up infrastructure.
+#
+# Decision: Safe to auto-trigger because the deploy repo pipeline has a MANUAL
+# gate before bring-up of staging infrastructure (trigger-infra-staging).
+# Production requires a second manual gate (promote-to-production) after
+# staging tests pass. So this trigger only starts validation + tag updates.
+#
+# Note: Deploy depends only on build-scan-push and integration-tests (hard gates).
+# It does NOT depend on Aikido (soft gate) — free-tier quota exhaustion
+# should never prevent deployment of verified, scanned code.
+
+# =============================================================================
+# STAGE 7a: UPDATE MANIFESTS — auto-update Kustomize image tags (main only)
+# =============================================================================
+# After Docker images are successfully built and pushed, automatically update
+# the Kustomize overlay files with the new image tag for dev environment only.
+# Staging and production manifests remain unchanged and must be updated manually.
+#
+# This implements a GitOps-style workflow where deployment manifests stay
+# in sync with the latest built images.
+#
+# Flow:
+#   1. Clone deployment repo (yr4-projectdeploymentrepo)
+#   2. Update image tag in kubernetes/overlays/dev/kustomization.yaml
+#   3. Commit and push changes back to deployment repo
+#   4. Staging and Production remain untouched (manual promotion workflow)
+#
+# Prerequisites:
+#   - DEPLOY_REPO_URL — git URL to deployment repo (HTTPS with embedded token)
+#   - DEPLOY_REPO_BRANCH — target branch (default: main)
+#   - CI_JOB_TOKEN — GitLab's built-in CI token for pushing (auto-provided)
+
+update-manifests:
+  stage: deploy
+  image: ${IMG_PFX}alpine:latest
+  needs:
+    - push-images
+  before_script:
+    - apk add --no-cache git curl
+  script:
+    - |
+      echo "========================================="
+      echo "Updating Kustomize manifests with new image tags"
+      echo "========================================="
+      echo ""
+
+      # Construct deployment repo URL — prefer GITLAB_API_TOKEN, fall back to CI_JOB_TOKEN
+      # CI_JOB_TOKEN requires: deployment repo > Settings > CI/CD > Job token permissions
+      #   → add this project (yr4-projectdevelopmentrepo) with write access
+      # GITLAB_API_TOKEN: project/group token with write_repository scope (set in CI/CD vars)
+      if [ -n "$GITLAB_API_TOKEN" ]; then
+        DEPLOY_REPO_URL="https://oauth2:${GITLAB_API_TOKEN}@gitlab.comp.dkit.ie/finalproject/Prototypes/yr4-projectdeploymentrepo.git"
+      else
+        DEPLOY_REPO_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.comp.dkit.ie/finalproject/Prototypes/yr4-projectdeploymentrepo.git"
+      fi
+      DEPLOY_REPO_BRANCH="${DEPLOY_REPO_BRANCH:-main}"
+
+      echo "Image tag: $IMAGE_TAG:*-$IMAGE_VERSION"
+      echo "Dev environment branch: $DEPLOY_REPO_BRANCH"
+      echo ""
+
+      # Clone the deployment repository
+      echo "Cloning deployment repository..."
+      git clone --depth 1 \
+        --branch "$DEPLOY_REPO_BRANCH" \
+        "$DEPLOY_REPO_URL" \
+        deployment-repo
+
+      cd deployment-repo
+      git config user.name "CI Pipeline"
+      git config user.email "ci@pipeline.local"
+      echo ""
+
+      # ── Phase 1: Update DEV environment ──
+      echo "========================================="
+      echo "Phase 1: Updating dev environment"
+      echo "========================================="
+
+      DEV_KUSTOMIZE="kubernetes/overlays/dev/kustomization.yaml"
+      if [ -f "$DEV_KUSTOMIZE" ]; then
+        echo "Found: $DEV_KUSTOMIZE"
+
+        # Extract current version from kustomization.yaml
+        CURRENT_TAG=$(grep "app.kubernetes.io/version:" "$DEV_KUSTOMIZE" | head -1 | awk -F'"' '{print $2}' || echo "unknown")
+        echo "Current version: $CURRENT_TAG"
+        echo "New version: $IMAGE_VERSION"
+
+        # Update the version label for GitOps tracking
+        # NOTE: Kustomize 'images:' with newTag cannot handle per-service tags
+        # (all services share the same image name with different tag prefixes).
+        # Actual image pinning to specific versions happens at deploy time via
+        # sed in the deploy-staging / deploy-production jobs.
+        sed -i "s|app.kubernetes.io/version: .*|app.kubernetes.io/version: \"$IMAGE_VERSION\"|" "$DEV_KUSTOMIZE"
+
+        echo "✅ Updated dev environment"
+      else
+        echo "❌ File not found: $DEV_KUSTOMIZE"
+        exit 1
+      fi
+      echo ""
+
+      # ── Phase 2: Commit and push changes ──
+      echo "========================================="
+      echo "Phase 2: Committing and pushing changes"
+      echo "========================================="
+
+      # Stage the updated files
+      git add kubernetes/overlays/dev/kustomization.yaml
+
+      # Check if there are any changes to commit
+      if git diff --cached --quiet; then
+        echo "ℹ️  No changes detected (tags may already be current)"
+        echo ""
+        echo "========================================="
+        echo "UPDATE MANIFESTS SUMMARY"
+        echo "========================================="
+        echo "ℹ️  Manifests are already up-to-date"
+        echo ""
+        echo "Current image tag: $IMAGE_TAG:*-$IMAGE_VERSION"
+        echo "Environments updated:"
+        echo "  ✓ Dev (kubernetes/overlays/dev/kustomization.yaml)"
+        echo "  ✗ Staging (remains unchanged for manual promotion)"
+        echo "  ✗ Production (remains unchanged for manual promotion)"
+        echo ""
+      else
+        # Commit with descriptive message including commit info
+        COMMIT_MSG="chore: update dev image tag to $IMAGE_VERSION [skip ci]
+
+        Triggered by build-scan-push job (commit: $CI_COMMIT_SHORT_SHA)
+        Source branch: $CI_COMMIT_BRANCH
+        Updated environments:
+          - kubernetes/overlays/dev/kustomization.yaml
+
+        Staging and Production remain unchanged and require manual promotion."
+
+        git commit -m "$COMMIT_MSG"
+
+        # Push to the deployment repo
+        git push origin "${DEPLOY_REPO_BRANCH:-main}" || {
+          echo ""
+          echo "❌ Failed to push to deployment repo (403 / permission denied)"
+          echo ""
+          echo "FIX: Go to yr4-projectdeploymentrepo > Settings > CI/CD > Job token permissions"
+          echo "     → Add 'finalproject/Prototypes/yr4-projectdevelopmentrepo' with write access"
+          echo ""
+          echo "OR: Create a project access token with write_repository scope and set"
+          echo "    GITLAB_API_TOKEN as a CI/CD variable in yr4-projectdevelopmentrepo"
+          exit 1
+        }
+
+        echo "✅ Changes pushed to deployment repository"
+        echo ""
+        echo "========================================="
+        echo "UPDATE MANIFESTS SUMMARY"
+        echo "========================================="
+        echo "✅ Dev environment manifests updated and deployed automatically"
+        echo ""
+        echo "Image tag: $IMAGE_TAG:*-$IMAGE_VERSION"
+        echo "Environments updated:"
+        echo "  ✓ Dev (kubernetes/overlays/dev/kustomization.yaml)"
+        echo "  ✗ Staging (remains unchanged for manual promotion)"
+        echo "  ✗ Production (remains unchanged for manual promotion)"
+        echo ""
+        echo "Deployment repo: ${DEPLOY_REPO_URL}"
+        echo "Next steps:"
+        echo "  1. Monitor dev deployment to verify image update"
+        echo "  2. When ready, manually update staging/production manifests"
+        echo ""
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: on_success
+      allow_failure: true  # Don't fail pipeline if manifest update fails
+  environment:
+    name: deployment-repo
+    url: "${DEPLOY_REPO_URL}"
+
+# =============================================================================
+# STAGE 7b: TRIGGER DEPLOY — fire deployment repo pipeline (main only)
+# =============================================================================
+# Uses GitLab native cross-project trigger to start the CD pipeline.
+# Passes image details so the deploy repo knows what version to deploy.
+#
+# The deploy repo pipeline validates manifests, updates staging tags,
+# then WAITS for manual approval before spinning up infra and deploying.
+#
+# REQUIRED CI/CD VARIABLES (set in GitLab > Settings > CI/CD > Variables):
+#   DEPLOY_REPO_TRIGGER_TOKEN — Pipeline trigger token from the deploy repo
+#   DEPLOY_REPO_TRIGGER_URL   — Trigger API URL for the deploy repo
+
+trigger-deploy:
+  stage: deploy
+  needs:
+    - push-images
+    - integration-tests-main
+  trigger:
+    project: finalproject/Prototypes/yr4-projectdeploymentrepo
+    branch: main
+    strategy: depend
+  variables:
+    IMAGE_TAG: $CI_REGISTRY_IMAGE
+    IMAGE_VERSION: $CI_COMMIT_SHORT_SHA
+    SOURCE_COMMIT: $CI_COMMIT_SHA
+    SOURCE_BRANCH: $CI_COMMIT_BRANCH
+    PIPELINE_MODE: $PIPELINE_MODE
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: on_success

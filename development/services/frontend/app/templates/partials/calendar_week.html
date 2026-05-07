@@ -1,0 +1,176 @@
+{#
+  Calendar Week View Partial
+
+  Renders the shared header + a 7-column (Mon → Sun) × time-slot
+  grid showing events for a single ISO week.  Multi-day events are
+  rendered as spanning bars in an all-day section above the time grid.
+
+  Template Variables:
+  ─────────────────
+  (header vars — see calendar_header.html)
+  week_data       : list[dict] — 7 items with .date, .day_name, .is_today, .events
+  allday_spans    : list[dict] — Multi-day spanning bar segments:
+      .event      : dict — The original event.
+      .start_col  : int  — 0-based column (0=Mon).
+      .span       : int  — Number of columns.
+      .is_start   : bool — True on the event's real start.
+      .is_end     : bool — True on the event's real end.
+      .lane       : int  — Vertical lane for stacking.
+  allday_max_lanes : int — Total lanes needed.
+  hour_slots : list[str]  — Half-hour labels ("06:00" → "22:30").
+  year, month, day : int
+#}
+
+{% include "partials/calendar_header.html" %}
+
+<!-- ── Week Grid Card ───────────────────────────────────────────────── -->
+<div class="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex-1 flex flex-col min-h-0">
+
+<!-- ── Week Column Headers ──────────────────────────────────────────── -->
+<div class="grid bg-gray-50/80 border-b border-gray-200 sticky top-0 z-20" style="grid-template-columns: 3.5rem repeat(7, 1fr);">
+    {# First column is the time gutter #}
+    <div class="px-1 py-2.5 text-center text-[10px] font-bold uppercase tracking-wider text-gray-400 border-r border-gray-200">
+        Time
+    </div>
+    {% for day in week_data %}
+    <div class="px-2 py-2.5 text-center border-r border-gray-100
+                {% if day.is_today %}bg-blue-50/70{% endif %}">
+        <div class="text-[10px] font-bold uppercase tracking-wider {% if day.is_today %}text-primary-600{% else %}text-gray-400{% endif %}">{{ day.day_name }}</div>
+        <div class="text-lg font-semibold mt-0.5
+                    {% if day.is_today %}text-white bg-primary-600 rounded-full w-8 h-8 flex items-center justify-center mx-auto shadow-sm
+                    {% else %}text-gray-700{% endif %}">
+            {{ day.date.day }}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+{% if allday_spans %}
+<!-- ── All-Day Spanning Bars Section ──────────────────────────────── -->
+<div class="grid border-b border-gray-300 bg-gray-50/50 sticky z-10" style="top: 4.5rem; grid-template-columns: 3.5rem repeat(7, 1fr);">
+    {# Gutter label #}
+    <div class="px-1 py-1 text-[10px] text-right text-gray-400 font-semibold border-r border-gray-200 flex items-center justify-end">
+        All day
+    </div>
+    {# 7-column spanning region #}
+    <div class="col-span-7 relative" style="min-height: {{ allday_max_lanes * 1.5 + 0.5 }}rem;">
+        {% for seg in allday_spans %}
+        <div class="absolute text-[11px] truncate cursor-pointer px-1.5 py-0.5 leading-tight
+                    {% if seg.is_start and seg.is_end %}rounded
+                    {% elif seg.is_start %}rounded-l
+                    {% elif seg.is_end %}rounded-r
+                    {% else %}rounded-none{% endif %}
+                    {% if seg.status == 'pending' %}status-pending
+                    {% elif seg.status == 'scheduled' %}status-scheduled
+                    {% elif seg.status == 'in_progress' %}status-in_progress
+                    {% elif seg.status == 'completed' %}status-completed
+                    {% else %}status-cancelled{% endif %}"
+             style="left: calc({{ seg.start_col }} / 7 * 100%);
+                    width: calc({{ seg.span }} / 7 * 100% - 4px);
+                    top: {{ seg.lane * 1.5 + 0.25 }}rem;
+                    height: 1.25rem;
+                    {% if seg.color %}background-color: {{ seg.color }}25; border-left: 3px solid {{ seg.color }};{% endif %}"
+             hx-get="/calendar/job-modal?job_id={{ seg.id }}"
+             hx-target="#modal-container"
+             hx-trigger="click"
+             @click.stop
+             draggable="true"
+             @dragstart="handleDragStart($event, {{ seg.id }})"
+             @dragend="handleDragEnd($event)"
+             title="{{ seg.title }}{% if seg.start_time %} ({{ seg.start_time }} – {{ seg.end_time }}){% endif %}">
+            {% if seg.is_start %}
+                {% if seg.start_time %}<span class="font-semibold">{{ seg.start_time }}</span> {% endif %}
+                {{ seg.title }}
+            {% else %}
+                <span class="opacity-60">↳ {{ seg.title }}</span>
+            {% endif %}
+            {% if seg.is_end and seg.end_time %}
+                <span class="float-right text-[10px] opacity-70">{{ seg.end_time }}</span>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<!-- ── Time-slot Grid (column-major, timed events use absolute positioning) ── -->
+<div class="week-grid overflow-y-auto flex-1 min-h-0" style="--slot-h: 1.75rem;">
+    <div class="grid" style="min-height: calc({{ hour_slots|length }} * var(--slot-h)); grid-template-columns: 3.5rem repeat(7, 1fr);">
+
+        {# ── Time gutter column ─────────────────────────────────── #}
+        <div class="border-r border-gray-200">
+            {% for slot in hour_slots %}
+            <div class="px-1 text-[10px] text-right text-gray-400 select-none flex items-start justify-end
+                        {% if slot.endswith(':00') %}font-semibold border-t border-gray-200{% else %}border-t border-gray-50{% endif %}"
+                 style="height: var(--slot-h);">
+                {% if slot.endswith(':00') %}<span class="-mt-0.5">{{ slot }}</span>{% endif %}
+            </div>
+            {% endfor %}
+        </div>
+
+        {# ── Day columns (timed events only — multi-day moved to all-day) ── #}
+        {% for day in week_data %}
+        <div class="relative border-r border-gray-50 {% if day.is_today %}bg-blue-50/20{% endif %}">
+
+            {# Background grid lines #}
+            {% for slot in hour_slots %}
+            <div class="{% if slot.endswith(':00') %}border-t border-gray-200{% else %}border-t border-gray-50{% endif %}
+                        hover:bg-gray-50/40 transition-colors"
+                 style="height: var(--slot-h);"
+                 @dragover.prevent="handleDragOver($event)"
+                 @drop="handleDrop($event, '{{ day.date.strftime('%Y-%m-%d') }}')">
+            </div>
+            {% endfor %}
+
+            {# Absolutely-positioned timed events — side-by-side via col_index / total_cols #}
+            {% for event in day.events %}
+            {% set total_cols = event.total_cols | default(1) %}
+            {% set col_index = event.col_index | default(0) %}
+            <div class="absolute event-chip text-[11px] rounded cursor-pointer overflow-hidden
+                        hover:z-50 transition-shadow hover:shadow-lg hover:ring-1 hover:ring-gray-300
+                        {% if event.status == 'pending' %}status-pending
+                        {% elif event.status == 'scheduled' %}status-scheduled
+                        {% elif event.status == 'in_progress' %}status-in_progress
+                        {% elif event.status == 'completed' %}status-completed
+                        {% else %}status-cancelled{% endif %}"
+                 style="top: calc({{ event.top_slots | default(0) }} * var(--slot-h));
+                        height: calc({{ event.height_slots | default(1) }} * var(--slot-h));
+                        left: calc({{ col_index }} / {{ total_cols }} * 100%);
+                        width: calc(1 / {{ total_cols }} * 100% - 4px);
+                        margin-left: 2px;
+                        z-index: {{ 5 + col_index }};
+                        {% if event.color %}border-left: 3px solid {{ event.color }};{% endif %}"
+                 draggable="true"
+                 @dragstart="handleDragStart($event, {{ event.id }})"
+                 @dragend="handleDragEnd($event)"
+                 hx-get="/calendar/job-modal?job_id={{ event.id }}"
+                 hx-target="#modal-container"
+                 hx-trigger="click"
+                 @click.stop
+                 title="{{ event.title }} ({{ event.start_time }}–{{ event.end_time or '?' }})">
+                <div class="px-1.5 py-0.5 h-full flex flex-col leading-tight">
+                    <span class="font-semibold text-[10px]">{{ event.start_time }}–{{ event.end_time or '?' }}</span>
+                    <span class="font-medium truncate">{{ event.title }}</span>
+                    {% if event.employee_name %}
+                    <span class="text-[10px] opacity-70 truncate">{{ event.employee_name }}</span>
+                    {% endif %}
+                    {% if (event.height_slots | default(1)) >= 4 and event.customer_name %}
+                    <span class="text-[10px] opacity-60 truncate mt-auto">{{ event.customer_name }}</span>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+
+        </div>
+        {% endfor %}
+
+    </div>
+</div>
+
+</div>{# close week grid card #}
+
+{# Hidden inputs — keep navigation state in sync #}
+<input type="hidden" id="current-year" value="{{ year }}">
+<input type="hidden" id="current-month" value="{{ month }}">
+<input type="hidden" id="current-view" value="week">
+<input type="hidden" id="current-day" value="{{ day }}">

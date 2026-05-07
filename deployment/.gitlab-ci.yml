@@ -1,0 +1,1961 @@
+# =============================================================================
+# Year 4 Project — CD Pipeline (Deployment Repo)
+# =============================================================================
+#
+# Triggered by the dev repo CI pipeline (trigger-deploy stage) via GitLab webhook.
+# Receives: IMAGE_TAG, IMAGE_VERSION, SOURCE_COMMIT, SOURCE_BRANCH
+#
+# Pipeline Architecture (mode-aware stages):
+#
+#   validate → update-tags → ensure-staging (triggers infra repo) → deploy-staging
+#     → staging-readiness → staging-tests → [destroy-staging → verify-destroy] → [promote
+#       → ensure-production (triggers infra repo) → deploy-prod → prod-validation] → notify
+#
+# PIPELINE_MODE controls how far a valid release goes:
+#   auto                  → full-release when IMAGE_VERSION exists, validate-only otherwise
+#   validate-only         → offline validation only, no live deploy
+#   staging-only          → deploy/test staging, then stop
+#   staging-teardown-test → deploy/test staging, destroy staging, verify destroy, then stop
+#   full-release          → staging deploy/test/destroy verification, then production promotion
+#
+# Environments:
+#   - Staging:    Auto-deploy, canary rollout, full test suite before promotion
+#   - Production: Manual gate, conservative canary rollout, post-deploy smoke tests
+#
+# Infrastructure:t
+#   - AWS EKS (managed via Terraform in infra repo)
+#   - Direct kubectl/kustomize deployments from pipeline
+#   - RDS PostgreSQL + ElastiCache Redis (AWS-managed, Terraform-provisioned)
+#   - External Secrets Operator for secrets from AWS Secrets Manager
+#
+# Scale-up/down jobs at the bottom allow bringing staging or production
+# infrastructure up and down independently when needed.
+#
+# =============================================================================
+
+stages:
+  - validate            # Lint manifests, validate Helm templates
+  - update-tags         # Patch Kustomize overlays with new image version
+  - ensure-staging      # Scale up staging cluster (or trigger infra pipeline)
+  - deploy-staging      # kubectl apply staging, rollout verification
+  - staging-readiness   # Post-deploy pod/service/migration diagnostics before smoke tests
+  - staging-tests       # Playwright E2E, Grafana k6 load tests, smoke tests
+  - destroy-staging     # Manually destroy staging infra before production promotion
+  - verify-destroy      # Confirm staging cost resources are gone and bootstrap remains
+  - promote             # Manual gate — approve promotion to production
+  - ensure-production   # Scale up production cluster (or trigger infra pipeline)
+  - deploy-prod         # kubectl apply production, rollout verification
+  - prod-validation     # Post-deploy smoke tests & health verification
+  - notify              # Slack/webhook notification of deploy result
+  - manual-ops          # Manual scale-up / scale-down jobs (independent)
+
+# =============================================================================
+# VARIABLES
+# =============================================================================
+
+variables:
+  # -- Passed from dev repo trigger-deploy stage --
+  # IMAGE_TAG:       Docker Hub registry path (e.g. bencev04/4th-year-proj-tadgh-bence)
+  # IMAGE_VERSION:   Short SHA of the source commit (e.g. a1b2c3d4)
+  # SOURCE_COMMIT:   Full SHA of the source commit
+  # SOURCE_BRANCH:   Branch that triggered the build (should be "main")
+  # PIPELINE_MODE:    auto | validate-only | staging-only | staging-teardown-test | full-release
+  PIPELINE_MODE: "auto"
+
+  # -- AWS credentials (set in GitLab CI/CD settings) --
+  # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+  AWS_DEFAULT_REGION: eu-west-1
+
+  # Runner checkout hardening: avoid stale shallow clone metadata on shared runners.
+  GIT_STRATEGY: clone
+  GIT_CLEAN_FLAGS: -ffdx
+  GIT_DEPTH: "0"
+
+  # -- Cluster (separate EKS clusters per environment) --
+  STAGING_CLUSTER_NAME: "yr4-project-staging-eks"
+  STAGING_NODE_GROUP: "yr4-project-staging-eks-nodes"
+  STAGING_MONITOR_PRINCIPAL_ARN: "arn:aws:iam::156041414798:user/BENCE_PC"
+  PROD_CLUSTER_NAME: "yr4-project-production-eks"
+  PROD_NODE_GROUP: "yr4-project-production-eks-nodes"
+  STAGING_NAMESPACE: "year4-project-staging"
+  PROD_NAMESPACE: "year4-project"
+  MONITORING_NAMESPACE: "monitoring"
+  LOGGING_NAMESPACE: "logging"
+  KUBE_PROM_STACK_RELEASE: "monitoring"
+  LOKI_RELEASE: "loki"
+  FLUENT_BIT_RELEASE: "fluent-bit"
+  # -- Infrastructure repo (set in GitLab CI/CD settings as masked variables) --
+  # INFRA_PROJECT_ID: ""        # GitLab project ID for yr4-projectinfrarepo
+  # INFRA_TRIGGER_TOKEN: ""     # Pipeline trigger token for infra repo
+  # GITLAB_API_TOKEN: ""        # GitLab personal/project token with API access (for polling)
+  # GITLAB_PUSH_TOKEN: ""       # GitLab personal/project token with write_repository (for GitOps commits)
+  # GITLAB_PUSH_USER: "oauth2"  # Optional token username; use project token username if oauth2 does not work
+
+  # -- App URLs --
+  # STAGING_URL and PROD_URL are discovered dynamically by deploy jobs
+  # and exported as dotenv artifacts for downstream smoke test jobs.
+
+  # -- Services list (matches dev repo) --
+  SERVICES: "nginx-gateway auth-service user-bl-service user-db-access-service job-bl-service job-db-access-service customer-bl-service customer-db-access-service admin-bl-service maps-access-service notification-service frontend migration-runner"
+  # Registry tags produced by the dev repo.
+  RELEASE_IMAGE_SERVICES: "nginx auth-service user-bl-service user-db-access-service job-bl-service job-db-access-service customer-bl-service customer-db-access-service admin-bl-service maps-access-service notification-service frontend migration-runner"
+
+# =============================================================================
+# STAGE 1: VALIDATE — Lint manifests, validate Helm templates
+# =============================================================================
+
+validate-manifests:
+  stage: validate
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl bash tar gzip
+    # Install kustomize
+    - curl -sL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.1/kustomize_v5.4.1_linux_amd64.tar.gz | tar xz -C /usr/local/bin/
+    # Install kubeconform
+    - curl -sL https://github.com/yannh/kubeconform/releases/download/v0.6.4/kubeconform-linux-amd64.tar.gz | tar xz -C /usr/local/bin/
+    # Install kubectl so validation exercises the same embedded Kustomize engine used by deploy jobs.
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  Validating Kubernetes manifests (kubeconform)"
+    - echo "═══════════════════════════════════════════════════════════════"
+    - |
+      for ENV in staging production; do
+        echo "── Validating overlay: $ENV ──"
+        kustomize build kubernetes/overlays/$ENV | kubeconform -strict -summary -skip ClusterIssuer,ClusterSecretStore,ExternalSecret
+        echo "── Validating overlay with kubectl embedded Kustomize: $ENV ──"
+        kubectl kustomize kubernetes/overlays/$ENV > /dev/null
+      done
+      echo "── Validating observability manifests ──"
+      kubeconform -strict -summary -skip ServiceMonitor,PrometheusRule kubernetes/observability/*.yaml
+    - echo ""
+    - echo "✅ All Kubernetes manifests are valid"
+  rules:
+    - when: always
+  allow_failure: false
+
+# NOTE: Terraform validation happens in the infra repo pipeline, not here.
+# This repo only contains Kubernetes manifests, Helm charts, and Kustomize overlays.
+
+validate-helm:
+  stage: validate
+  image:
+    name: alpine/helm:3.14.0
+    entrypoint: [""]
+  before_script:
+    - helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    - helm repo add grafana https://grafana.github.io/helm-charts
+    - helm repo update
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  Validating Helm templates"
+    - echo "═══════════════════════════════════════════════════════════════"
+    - |
+      for CHART in year4-project fluent-bit prometheus grafana; do
+        for ENV in dev staging prod; do
+          echo "── helm template: ${CHART} values-${ENV}.yaml ──"
+          helm template "${CHART}" "helm/${CHART}" \
+            -f "helm/${CHART}/values-${ENV}.yaml" \
+            --debug > /dev/null
+        done
+      done
+      echo "── helm template: kube-prometheus-stack staging values ──"
+      helm template "$KUBE_PROM_STACK_RELEASE" prometheus-community/kube-prometheus-stack \
+        -f helm/kube-prometheus-stack/values-staging.yaml \
+        --namespace "$MONITORING_NAMESPACE" \
+        --debug > /dev/null
+
+      echo "── helm template: Loki staging values ──"
+      helm template "$LOKI_RELEASE" grafana/loki \
+        -f helm/loki/values-staging.yaml \
+        --namespace "$MONITORING_NAMESPACE" \
+        --debug > /dev/null
+    - echo ""
+    - echo "✅ All Helm templates render successfully"
+  rules:
+    - when: always
+  allow_failure: false
+
+validate-deployment-mode:
+  stage: validate
+  image: alpine:latest
+  before_script: []
+  script:
+    - |
+      set -eu
+      MODE="${PIPELINE_MODE:-auto}"
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Validating deployment mode"
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "PIPELINE_MODE=$MODE"
+      echo "IMAGE_VERSION=${IMAGE_VERSION:-<not set>}"
+
+      case "$MODE" in
+        auto|validate-only|staging-only|staging-teardown-test|full-release) ;;
+        *)
+          echo "❌ Unsupported PIPELINE_MODE: $MODE"
+          echo "   Allowed: auto, validate-only, staging-only, staging-teardown-test, full-release"
+          exit 1
+          ;;
+      esac
+
+      if [ "$MODE" != "auto" ] && [ "$MODE" != "validate-only" ] && [ -z "${IMAGE_VERSION:-}" ]; then
+        echo "❌ PIPELINE_MODE=$MODE performs a live deployment and requires IMAGE_VERSION from the dev repo or a manual known-good release."
+        exit 1
+      fi
+
+      if [ "$MODE" = "auto" ] && [ -z "${IMAGE_VERSION:-}" ]; then
+        echo "ℹ️  No IMAGE_VERSION was provided; auto mode resolves to validate-only."
+      elif [ "$MODE" = "auto" ]; then
+        echo "ℹ️  IMAGE_VERSION was provided; auto mode resolves to full-release."
+      fi
+  rules:
+    - when: always
+  allow_failure: false
+
+validate-image-version:
+  stage: validate
+  image: alpine:latest
+  before_script: []
+  script:
+    - sh scripts/deployment/validate-image-version.sh
+  rules:
+    - if: $IMAGE_VERSION
+      when: on_success
+  allow_failure: false
+
+verify-release-images:
+  stage: validate
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache skopeo
+  script:
+    - sh scripts/deployment/verify-release-images.sh
+  rules:
+    - if: $IMAGE_VERSION
+      when: on_success
+  allow_failure: false
+
+# =============================================================================
+# STAGE 2: UPDATE TAGS — Patch Kustomize overlays with new image version
+# =============================================================================
+#
+# This commits the updated image tags back to the deployment repo.
+#
+# References dev repo: IMAGE_TAG = $CI_REGISTRY_IMAGE, IMAGE_VERSION = $CI_COMMIT_SHORT_SHA
+# Image naming convention: $IMAGE_TAG:{service}-{IMAGE_VERSION} and {service}-latest
+# (see dev repo .gitlab-ci.yml build-scan-push stage)
+
+update-image-tags:
+  stage: update-tags
+  image: alpine:latest
+  needs:
+    - validate-manifests
+    - validate-helm
+    - validate-deployment-mode
+    - validate-image-version
+    - verify-release-images
+  before_script:
+    - apk add --no-cache git sed
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  Updating Kustomize image tags"
+    - 'echo "  IMAGE_TAG:     ${IMAGE_TAG}"'
+    - 'echo "  IMAGE_VERSION: ${IMAGE_VERSION}"'
+    - 'echo "  SOURCE_COMMIT: ${SOURCE_COMMIT}"'
+    - echo "═══════════════════════════════════════════════════════════════"
+    - |
+      # ── Guard: Fail fast if required variables are missing ──
+      MISSING=""
+      if [ -z "$IMAGE_TAG" ]; then MISSING="$MISSING IMAGE_TAG"; fi
+      if [ -z "$IMAGE_VERSION" ]; then MISSING="$MISSING IMAGE_VERSION"; fi
+      if [ -n "$MISSING" ]; then
+        echo ""
+        echo "❌ MISSING REQUIRED VARIABLES:$MISSING"
+        echo ""
+        echo "This pipeline must be triggered by the dev repo (cross-project trigger)"
+        echo "with IMAGE_TAG and IMAGE_VERSION set. If this was triggered by a direct"
+        echo "push, those variables are not available."
+        exit 1
+      fi
+      # Guard: catch unexpanded variable references (bridge job bug)
+      case "$IMAGE_VERSION" in
+        *'$'*) echo "❌ IMAGE_VERSION contains literal dollar sign: $IMAGE_VERSION"; echo "   Bridge job did not expand the variable. Fix trigger-deploy in dev repo."; exit 1 ;;
+      esac
+    - |
+      # ── Update version label in staging overlay for GitOps tracking ──
+      # NOTE: Kustomize 'images:' with newTag cannot handle per-service tags
+      # (all services share bencev04/4th-year-proj-tadgh-bence with different
+      # tag prefixes like auth-service-latest, admin-bl-service-latest).
+      # Actual image pinning happens in deploy-staging via sed.
+      # Rebase onto latest main first to avoid non-fast-forward push failures.
+      git fetch origin main
+      git checkout -B main origin/main
+      cd kubernetes/overlays/staging
+      sed -i "s|app.kubernetes.io/version: .*|app.kubernetes.io/version: \"${IMAGE_VERSION}\"|" kustomization.yaml
+      cd "$CI_PROJECT_DIR"
+    - git config user.email "cd-pipeline@gitlab.ci"
+    - git config user.name "CD Pipeline"
+    - git add kubernetes/overlays/staging/kustomization.yaml
+    - 'git commit -m "ci: update staging version to ${IMAGE_VERSION} [skip ci] - Source: ${SOURCE_COMMIT}" || echo "No changes to commit"'
+    - |
+      # Push with a token that can write to this repository.
+      # Prefer GITLAB_PUSH_TOKEN so GITLAB_API_TOKEN can stay API-only for infra polling.
+      if [ -n "$GITLAB_PUSH_TOKEN" ]; then
+        PUSH_USER="${GITLAB_PUSH_USER:-oauth2}"
+        PUSH_URL="https://${PUSH_USER}:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      elif [ -n "$GITLAB_API_TOKEN" ]; then
+        echo "WARNING: GITLAB_PUSH_TOKEN is not set; using legacy GITLAB_API_TOKEN for repository push."
+        echo "         This token must have write_repository scope."
+        PUSH_USER="${GITLAB_PUSH_USER:-oauth2}"
+        PUSH_URL="https://${PUSH_USER}:${GITLAB_API_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      else
+        echo "WARNING: GITLAB_PUSH_TOKEN not set; falling back to CI_JOB_TOKEN."
+        echo "         If push fails, enable CI job-token push for this project"
+        echo "         or set GITLAB_PUSH_TOKEN with write_repository scope."
+        PUSH_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      fi
+
+      # Retry on non-fast-forward races from parallel pipelines.
+      # The change is deterministic (set version label), so rebase-and-retry is safe.
+      for ATTEMPT in 1 2 3; do
+        PUSH_STATUS=0
+        PUSH_OUTPUT="$(git push "$PUSH_URL" HEAD:main 2>&1)" || PUSH_STATUS=$?
+        echo "$PUSH_OUTPUT"
+
+        if [ "$PUSH_STATUS" -eq 0 ]; then
+          echo "✅ Push succeeded on attempt $ATTEMPT"
+          break
+        fi
+
+        case "$PUSH_OUTPUT" in
+          *"HTTP Basic: Access denied"*|*"Authentication failed"*|*"not allowed to push"*|*"403"*)
+            echo "ERROR: Git push authentication failed."
+            echo "Set GITLAB_PUSH_TOKEN to a non-expired personal/project access token with write_repository scope."
+            echo "If you use a project access token, set GITLAB_PUSH_USER to that token's username if oauth2 is rejected."
+            echo "Alternatively, enable CI_JOB_TOKEN push access for this project and leave GITLAB_PUSH_TOKEN unset."
+            exit "$PUSH_STATUS"
+            ;;
+        esac
+
+        if [ "$ATTEMPT" -eq 3 ]; then
+          echo "❌ Push failed after 3 attempts (likely sustained write race)."
+          exit 1
+        fi
+
+        echo "⚠️  Push rejected (non-fast-forward). Rebasing on latest main and retrying..."
+        if ! FETCH_OUTPUT="$(git fetch "$PUSH_URL" main 2>&1)"; then
+          echo "$FETCH_OUTPUT"
+          echo "ERROR: Could not fetch latest main before retrying push."
+          exit 1
+        fi
+        git rebase FETCH_HEAD
+      done
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_success
+  allow_failure: false
+
+# =============================================================================
+# STAGE 3a: ENSURE STAGING — Trigger infra repo to bring staging cluster up
+# =============================================================================
+# Cross-project trigger: fires the infra repo pipeline with ENSURE_UP=true
+# and TARGET_ENV=staging. The infra repo handles all three scenarios:
+#   1. Cluster running with nodes   → exit 0 (instant)
+#   2. Cluster exists, 0 nodes      → scale up
+#   3. Cluster doesn't exist at all → full terraform apply (ensure-apply)
+#
+# strategy: depend → this CD pipeline WAITS until the infra pipeline finishes.
+# If the infra pipeline fails, this job fails, blocking the deploy.
+#
+# REQUIRED CI/CD VARIABLES:
+#   INFRA_PROJECT_ID    — GitLab project ID for yr4-projectinfrarepo
+#   INFRA_TRIGGER_TOKEN — Pipeline trigger token created in the infra repo
+#                         (Settings > CI/CD > Pipeline trigger tokens)
+
+trigger-infra-staging:
+  stage: ensure-staging
+  needs:
+    - update-image-tags
+  trigger:
+    project: finalproject/Prototypes/yr4-projectinfrarepo
+    strategy: depend
+  variables:
+    ENSURE_UP: "true"
+    TARGET_ENV: "staging"
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_success
+      allow_failure: false
+
+# After the infra pipeline completes, do a quick readiness check to confirm
+# nodes are actually in Ready state before kubectl tries to deploy.
+wait-staging-ready:
+  stage: ensure-staging
+  image: alpine:latest
+  needs:
+    - trigger-infra-staging
+  before_script:
+    - apk add --no-cache curl bash python3 py3-pip
+    - pip3 install --break-system-packages awscli
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+  script:
+    - |
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Verifying STAGING cluster readiness after infra trigger"
+      echo "═══════════════════════════════════════════════════════════════"
+
+      # Confirm cluster exists (should always pass after infra pipeline)
+      if ! aws eks describe-cluster --name $STAGING_CLUSTER_NAME --region $AWS_DEFAULT_REGION > /dev/null 2>&1; then
+        echo "❌ Staging cluster still does not exist after infra trigger."
+        echo "   Check the infra repo pipeline for errors."
+        exit 1
+      fi
+
+      # Confirm nodes are active
+      DESIRED=$(aws eks describe-nodegroup \
+        --cluster-name $STAGING_CLUSTER_NAME \
+        --nodegroup-name $STAGING_NODE_GROUP \
+        --region $AWS_DEFAULT_REGION \
+        --query 'nodegroup.scalingConfig.desiredSize' \
+        --output text 2>/dev/null || echo "0")
+
+      if [ "$DESIRED" = "0" ] || [ "$DESIRED" = "None" ]; then
+        echo "❌ Staging nodes still at 0 after infra trigger."
+        exit 1
+      fi
+
+      echo "✅ Staging node group ready — $DESIRED node(s) desired."
+
+      # Ensure local monitor IAM principal keeps access after cluster recreate.
+      if [ -n "$STAGING_MONITOR_PRINCIPAL_ARN" ]; then
+        echo "Ensuring EKS access entry for monitor principal: $STAGING_MONITOR_PRINCIPAL_ARN"
+        ENTRY_EXISTS=$(aws eks list-access-entries \
+          --cluster-name $STAGING_CLUSTER_NAME \
+          --region $AWS_DEFAULT_REGION \
+          --query "contains(accessEntries, '$STAGING_MONITOR_PRINCIPAL_ARN')" \
+          --output text 2>/dev/null || echo "False")
+
+        if [ "$ENTRY_EXISTS" != "True" ]; then
+          aws eks create-access-entry \
+            --cluster-name $STAGING_CLUSTER_NAME \
+            --principal-arn "$STAGING_MONITOR_PRINCIPAL_ARN" \
+            --region $AWS_DEFAULT_REGION
+          echo "✅ Created access entry for monitor principal"
+        else
+          echo "✅ Access entry already exists for monitor principal"
+        fi
+
+        ADMIN_POLICY_ARN="arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+        HAS_ADMIN_POLICY=$(aws eks list-associated-access-policies \
+          --cluster-name $STAGING_CLUSTER_NAME \
+          --principal-arn "$STAGING_MONITOR_PRINCIPAL_ARN" \
+          --region $AWS_DEFAULT_REGION \
+          --query "contains(associatedAccessPolicies[].policyArn, '$ADMIN_POLICY_ARN')" \
+          --output text 2>/dev/null || echo "False")
+
+        if [ "$HAS_ADMIN_POLICY" != "True" ]; then
+          aws eks associate-access-policy \
+            --cluster-name $STAGING_CLUSTER_NAME \
+            --principal-arn "$STAGING_MONITOR_PRINCIPAL_ARN" \
+            --policy-arn "$ADMIN_POLICY_ARN" \
+            --access-scope type=cluster \
+            --region $AWS_DEFAULT_REGION
+          echo "✅ Associated cluster-admin policy for monitor principal"
+        else
+          echo "✅ Monitor principal already has cluster-admin policy"
+        fi
+      fi
+
+      # Show which IAM identity this job is using (helps debug auth issues)
+      echo "── IAM identity for this job ──"
+      aws sts get-caller-identity --output table || echo "⚠️  Could not determine caller identity"
+
+      # Wait for K8s API to become reachable (up to 10 minutes)
+      aws eks update-kubeconfig --name $STAGING_CLUSTER_NAME --region $AWS_DEFAULT_REGION
+
+      echo "Waiting for Kubernetes API to become reachable..."
+      API_ENDPOINT=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+      echo "  API endpoint: $API_ENDPOINT"
+
+      for ATTEMPT in $(seq 1 40); do
+        if kubectl --request-timeout=15s get --raw=/readyz >/dev/null 2>&1; then
+          echo "✅ Kubernetes API is reachable (attempt $ATTEMPT/40)"
+          exit 0
+        fi
+        if [ "$ATTEMPT" -eq 1 ] || [ "$((ATTEMPT % 5))" -eq 0 ]; then
+          echo "  Diagnostic (attempt $ATTEMPT/40):"
+          kubectl --request-timeout=10s get --raw=/readyz 2>&1 || true
+        else
+          echo "  ⚠️  API not reachable yet (attempt $ATTEMPT/40), retrying in 15s..."
+        fi
+        sleep 15
+      done
+
+      echo "❌ Kubernetes API not reachable after 10 minutes"
+      echo ""
+      echo "Diagnostics:"
+      echo "── Cluster status ──"
+      aws eks describe-cluster --name $STAGING_CLUSTER_NAME --region $AWS_DEFAULT_REGION \
+        --query 'cluster.{Status:status,Endpoint:endpoint,PlatformVersion:platformVersion}' --output table || true
+      echo "── Node group status ──"
+      aws eks describe-nodegroup --cluster-name $STAGING_CLUSTER_NAME --nodegroup-name $STAGING_NODE_GROUP --region $AWS_DEFAULT_REGION \
+        --query 'nodegroup.{Status:status,DesiredSize:scalingConfig.desiredSize,Health:health}' --output table || true
+      echo "── DNS resolution ──"
+      nslookup $(echo $API_ENDPOINT | sed 's|https://||') 2>&1 || echo "DNS resolution failed"
+      echo "── curl to API endpoint ──"
+      curl -sk --connect-timeout 10 --max-time 15 "${API_ENDPOINT}/readyz" 2>&1 | head -20 || echo "curl failed"
+      exit 1
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_success
+  allow_failure: false
+
+# =============================================================================
+# STAGE 3b: INSTALL CLUSTER ADD-ONS — cert-manager, ESO, NGINX Ingress
+# =============================================================================
+# Installs required Helm charts before deploying the application. Uses
+# "helm upgrade --install" so it's idempotent (safe on re-runs).
+# Runs AFTER the cluster is confirmed ready, BEFORE the app deploy.
+
+install-addons-staging:
+  stage: deploy-staging
+  image: alpine:latest
+  resource_group: staging-cluster-addons
+  needs:
+    - wait-staging-ready
+  before_script:
+    - apk add --no-cache curl bash tar gzip python3 py3-pip
+    - pip3 install --break-system-packages awscli
+    # Install kubectl
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    # Install Helm (direct binary download)
+    - curl -sL "https://get.helm.sh/helm-v3.17.0-linux-amd64.tar.gz" | tar xz -C /tmp
+    - mv /tmp/linux-amd64/helm /usr/local/bin/
+    # Configure kubeconfig (retry for transient AWS API/DNS issues)
+    - |
+      for ATTEMPT in 1 2 3; do
+        if aws eks update-kubeconfig --name $STAGING_CLUSTER_NAME --region $AWS_DEFAULT_REGION; then
+          break
+        fi
+        if [ "$ATTEMPT" -eq 3 ]; then
+          echo "❌ Failed to configure kubeconfig after 3 attempts"
+          exit 1
+        fi
+        echo "⚠️  update-kubeconfig failed (attempt $ATTEMPT/3), retrying in 10s..."
+        sleep 10
+      done
+  script:
+    - |
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Installing cluster add-ons for STAGING"
+      echo "═══════════════════════════════════════════════════════════════"
+
+      retry_cmd() {
+        ATTEMPTS=$1
+        DELAY=$2
+        shift 2
+        TRY=1
+        until "$@"; do
+          if [ "$TRY" -ge "$ATTEMPTS" ]; then
+            echo "❌ Command failed after ${ATTEMPTS} attempts: $*"
+            return 1
+          fi
+          echo "⚠️  Command failed (attempt ${TRY}/${ATTEMPTS}): $*"
+          echo "   Retrying in ${DELAY}s..."
+          sleep "$DELAY"
+          TRY=$((TRY + 1))
+        done
+      }
+
+      wait_for_k8s_api() {
+        ATTEMPTS=$1
+        DELAY=$2
+        TRY=1
+        while [ "$TRY" -le "$ATTEMPTS" ]; do
+          if kubectl --request-timeout=15s get --raw=/readyz >/dev/null 2>&1; then
+            echo "✅ Kubernetes API reachable (attempt ${TRY}/${ATTEMPTS})"
+            return 0
+          fi
+          # Show actual error every 5th attempt for diagnostics
+          if [ "$((TRY % 5))" -eq 0 ]; then
+            echo "⚠️  Kubernetes API not reachable (attempt ${TRY}/${ATTEMPTS}) — error:"
+            kubectl --request-timeout=10s get --raw=/readyz 2>&1 || true
+          else
+            echo "⚠️  Kubernetes API not reachable yet (attempt ${TRY}/${ATTEMPTS}), retrying in ${DELAY}s..."
+          fi
+          sleep "$DELAY"
+          TRY=$((TRY + 1))
+        done
+        echo "❌ Kubernetes API not reachable after ${ATTEMPTS} checks"
+        echo "── Final diagnostic ──"
+        kubectl --request-timeout=10s cluster-info 2>&1 || true
+        return 1
+      }
+
+      clear_pending_helm_release() {
+        RELEASE=$1
+        NAMESPACE=$2
+        STATUS=$(helm status "$RELEASE" -n "$NAMESPACE" -o json 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+        case "$STATUS" in
+          pending-install|pending-upgrade|pending-rollback)
+            echo "⚠️  Helm release $RELEASE in $NAMESPACE is $STATUS — clearing stale operation lock..."
+            helm rollback "$RELEASE" 0 -n "$NAMESPACE" 2>/dev/null || true
+            helm uninstall "$RELEASE" -n "$NAMESPACE" 2>/dev/null || true
+            sleep 10
+            ;;
+        esac
+      }
+
+      wait_for_k8s_api 30 15
+
+      # Look up IAM role ARNs (created by Terraform)
+      ESO_ROLE_ARN=$(aws iam get-role \
+        --role-name yr4-project-staging-eso-role \
+        --query 'Role.Arn' --output text)
+      echo "ESO Role ARN: $ESO_ROLE_ARN"
+
+      # 1. cert-manager (TLS certificate management)
+      echo "--- Installing cert-manager ---"
+      retry_cmd 4 10 helm repo add jetstack https://charts.jetstack.io
+      retry_cmd 4 10 helm repo update jetstack
+      clear_pending_helm_release cert-manager cert-manager
+      # Pre-install CRDs to avoid startupapicheck deadlock on fresh clusters
+      echo "  Applying cert-manager CRDs..."
+      retry_cmd 4 15 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.7/cert-manager.crds.yaml
+      if ! retry_cmd 6 30 helm upgrade --install cert-manager jetstack/cert-manager \
+        --version 1.14.7 \
+        --namespace cert-manager --create-namespace \
+        --set crds.enabled=true \
+        --set startupapicheck.enabled=false \
+        --wait --timeout 300s; then
+        echo "❌ cert-manager install failed after retries. Diagnostics:"
+        kubectl get pods -n cert-manager -o wide || true
+        kubectl get events -n cert-manager --sort-by=.lastTimestamp | tail -50 || true
+        exit 1
+      fi
+
+      # 2. External Secrets Operator (syncs AWS Secrets Manager → K8s Secrets)
+      echo "--- Installing External Secrets Operator ---"
+      retry_cmd 4 10 helm repo add external-secrets https://charts.external-secrets.io
+      retry_cmd 4 10 helm repo update external-secrets
+      clear_pending_helm_release external-secrets external-secrets
+      retry_cmd 10 30 helm upgrade --install external-secrets external-secrets/external-secrets \
+        --namespace external-secrets --create-namespace \
+        --set installCRDs=true \
+        --set serviceAccount.create=true \
+        --set serviceAccount.name=external-secrets-sa \
+        --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$ESO_ROLE_ARN" \
+        --wait --timeout 300s
+
+      sh scripts/deployment/ensure-external-secret-store.sh
+
+      # 3. NGINX Ingress Controller — SKIPPED for staging
+      # Staging uses nginx-gateway LoadBalancer directly (no Ingress resource needed).
+      # The ingress-nginx controller is only installed for production (TLS via cert-manager).
+      echo "--- Skipping NGINX Ingress Controller (not needed for staging) ---"
+
+      echo ""
+      echo "✅ All staging add-ons installed successfully"
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_success
+  allow_failure: false
+
+preflight-staging:
+  stage: deploy-staging
+  image: alpine:latest
+  needs:
+    - install-addons-staging
+  before_script:
+    - apk add --no-cache curl bash python3 py3-pip
+    - pip3 install --break-system-packages awscli
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - aws eks update-kubeconfig --name $STAGING_CLUSTER_NAME --region $AWS_DEFAULT_REGION
+  script:
+    - |
+      set -eu
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Preflight — STAGING cluster, add-ons, and secrets"
+      echo "═══════════════════════════════════════════════════════════════"
+
+      CLUSTER_STATUS=$(aws eks describe-cluster \
+        --name "$STAGING_CLUSTER_NAME" \
+        --region "$AWS_DEFAULT_REGION" \
+        --query 'cluster.status' --output text)
+      if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
+        echo "❌ Staging EKS cluster is not ACTIVE: $CLUSTER_STATUS"
+        exit 1
+      fi
+      echo "✅ EKS cluster ACTIVE: $STAGING_CLUSTER_NAME"
+
+      NODEGROUP_STATUS=$(aws eks describe-nodegroup \
+        --cluster-name "$STAGING_CLUSTER_NAME" \
+        --nodegroup-name "$STAGING_NODE_GROUP" \
+        --region "$AWS_DEFAULT_REGION" \
+        --query 'nodegroup.status' --output text)
+      if [ "$NODEGROUP_STATUS" != "ACTIVE" ]; then
+        echo "❌ Staging node group is not ACTIVE: $NODEGROUP_STATUS"
+        exit 1
+      fi
+      echo "✅ Node group ACTIVE: $STAGING_NODE_GROUP"
+
+      kubectl --request-timeout=15s get --raw=/readyz >/dev/null
+      echo "✅ Kubernetes API reachable"
+
+      READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 ~ /Ready/ { count++ } END { print count + 0 }')
+      if [ "$READY_NODES" -lt 1 ]; then
+        echo "❌ No Ready Kubernetes nodes found"
+        kubectl get nodes -o wide || true
+        exit 1
+      fi
+      echo "✅ Ready nodes: $READY_NODES"
+
+      kubectl get namespace cert-manager >/dev/null
+      kubectl get namespace external-secrets >/dev/null
+      kubectl get crd externalsecrets.external-secrets.io >/dev/null
+      kubectl get crd clustersecretstores.external-secrets.io >/dev/null
+      kubectl get clustersecretstore aws-secrets-manager >/dev/null
+      echo "✅ Required add-ons and External Secrets store are present"
+
+      for SECRET_NAME in \
+        "yr4-project/staging/db-credentials" \
+        "yr4-project/staging/redis-credentials" \
+        "yr4-project/staging/app-secrets" \
+        "yr4-project/staging/api-keys"; do
+        if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --region "$AWS_DEFAULT_REGION" >/dev/null 2>&1; then
+          echo "✅ Secrets Manager secret exists: $SECRET_NAME"
+        else
+          echo "❌ Required Secrets Manager secret missing or inaccessible: $SECRET_NAME"
+          exit 1
+        fi
+      done
+
+      echo "✅ Staging preflight passed"
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_success
+  allow_failure: false
+
+install-observability-staging:
+  stage: deploy-staging
+  image: alpine:latest
+  resource_group: staging-observability
+  needs:
+    - preflight-staging
+  before_script:
+    - apk add --no-cache curl bash tar gzip python3 py3-pip openssl
+    - pip3 install --break-system-packages awscli
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - curl -sL "https://get.helm.sh/helm-v3.17.0-linux-amd64.tar.gz" | tar xz -C /tmp
+    - mv /tmp/linux-amd64/helm /usr/local/bin/
+    - helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    - helm repo add grafana https://grafana.github.io/helm-charts
+    - helm repo update
+    - aws eks update-kubeconfig --name $STAGING_CLUSTER_NAME --region $AWS_DEFAULT_REGION
+  script:
+    - |
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Installing observability foundation for STAGING"
+      echo "═══════════════════════════════════════════════════════════════"
+
+      kubectl apply -f kubernetes/observability/storageclass-gp3.yaml
+      kubectl apply -f kubernetes/observability/namespace-monitoring.yaml
+      kubectl apply -f kubernetes/observability/namespace-logging.yaml
+      kubectl apply -f kubernetes/observability/limitrange-observability.yaml
+      kubectl apply -f kubernetes/observability/resourcequota-observability.yaml
+
+      sh scripts/deployment/check-cloudwatch-observability.sh "$STAGING_CLUSTER_NAME"
+
+      # Remove stale kube-prometheus-stack admission hook jobs left by failed installs.
+      kubectl delete job \
+        kube-prometheus-stack-admission-create \
+        kube-prometheus-stack-admission-patch \
+        -n "$MONITORING_NAMESPACE" --ignore-not-found=true --wait=false
+
+      KUBE_PROM_STATUS=$(helm status "$KUBE_PROM_STACK_RELEASE" -n "$MONITORING_NAMESPACE" -o json 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+      case "$KUBE_PROM_STATUS" in
+        pending-install|pending-upgrade|pending-rollback)
+          echo "⚠️  kube-prometheus-stack release is $KUBE_PROM_STATUS — clearing stale Helm operation lock..."
+          helm rollback "$KUBE_PROM_STACK_RELEASE" 0 -n "$MONITORING_NAMESPACE" 2>/dev/null || true
+          helm uninstall "$KUBE_PROM_STACK_RELEASE" -n "$MONITORING_NAMESPACE" 2>/dev/null || true
+          sleep 10
+          ;;
+      esac
+
+      GRAFANA_USER="${GRAFANA_ADMIN_USER:-admin}"
+      GRAFANA_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-$(openssl rand -base64 24)}"
+      kubectl create secret generic grafana-admin \
+        --namespace "$MONITORING_NAMESPACE" \
+        --from-literal=admin-user="$GRAFANA_USER" \
+        --from-literal=admin-password="$GRAFANA_PASSWORD" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+      if [ -z "${LOKI_S3_BUCKET:-}" ]; then
+        LOKI_S3_BUCKET=$(aws s3api list-buckets \
+          --query 'Buckets[?starts_with(Name, `yr4-project-staging-loki-`)].Name | [0]' \
+          --output text)
+      fi
+      if [ -z "$LOKI_S3_BUCKET" ] || [ "$LOKI_S3_BUCKET" = "None" ]; then
+        echo "❌ LOKI_S3_BUCKET was not provided and no yr4-project-staging-loki-* bucket was found"
+        exit 1
+      fi
+      echo "Loki S3 bucket: $LOKI_S3_BUCKET"
+
+      LOKI_ROLE_ARN="${LOKI_ROLE_ARN:-$(aws iam get-role \
+        --role-name yr4-project-staging-loki-role \
+        --query 'Role.Arn' --output text)}"
+      echo "Loki Role ARN: $LOKI_ROLE_ARN"
+
+      echo "--- Installing kube-prometheus-stack ---"
+      if ! helm upgrade --install "$KUBE_PROM_STACK_RELEASE" prometheus-community/kube-prometheus-stack \
+        -f helm/kube-prometheus-stack/values-staging.yaml \
+        --namespace "$MONITORING_NAMESPACE" --create-namespace \
+        --wait --timeout 600s; then
+        echo "❌ kube-prometheus-stack install/upgrade failed. Diagnostics:"
+        helm status "$KUBE_PROM_STACK_RELEASE" -n "$MONITORING_NAMESPACE" || true
+        kubectl get pods -n "$MONITORING_NAMESPACE" -o wide || true
+        kubectl get jobs -n "$MONITORING_NAMESPACE" || true
+        kubectl describe job kube-prometheus-stack-admission-create -n "$MONITORING_NAMESPACE" || true
+        kubectl describe job kube-prometheus-stack-admission-patch -n "$MONITORING_NAMESPACE" || true
+        kubectl get pvc -n "$MONITORING_NAMESPACE" || true
+        kubectl get events -n "$MONITORING_NAMESPACE" --sort-by=.lastTimestamp | tail -100 || true
+        exit 1
+      fi
+
+      echo "--- Installing Loki ---"
+      if ! helm upgrade --install "$LOKI_RELEASE" grafana/loki \
+        -f helm/loki/values-staging.yaml \
+        --namespace "$MONITORING_NAMESPACE" --create-namespace \
+        --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$LOKI_ROLE_ARN" \
+        --set "loki.storage.bucketNames.chunks=$LOKI_S3_BUCKET" \
+        --set "loki.storage.bucketNames.ruler=$LOKI_S3_BUCKET" \
+        --set "loki.storage.bucketNames.admin=$LOKI_S3_BUCKET" \
+        --set "loki.storage.s3.region=$AWS_DEFAULT_REGION" \
+        --wait --timeout 600s; then
+        echo "❌ Loki install/upgrade failed. Diagnostics:"
+        kubectl get pods -n "$MONITORING_NAMESPACE" -o wide || true
+        kubectl get pvc -n "$MONITORING_NAMESPACE" || true
+        kubectl describe statefulset "$LOKI_RELEASE" -n "$MONITORING_NAMESPACE" || true
+        kubectl describe pod -n "$MONITORING_NAMESPACE" -l "app.kubernetes.io/instance=$LOKI_RELEASE" || true
+        kubectl get events -n "$MONITORING_NAMESPACE" --sort-by=.lastTimestamp | tail -80 || true
+        exit 1
+      fi
+
+      FLUENT_BIT_ROLE_ARN="${FLUENT_BIT_ROLE_ARN:-$(aws iam get-role \
+        --role-name yr4-project-staging-fluent-bit-role \
+        --query 'Role.Arn' --output text)}"
+      echo "Fluent Bit Role ARN: $FLUENT_BIT_ROLE_ARN"
+
+      helm upgrade --install "$FLUENT_BIT_RELEASE" helm/fluent-bit \
+        -f helm/fluent-bit/values-staging.yaml \
+        --namespace "$LOGGING_NAMESPACE" --create-namespace \
+        --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$FLUENT_BIT_ROLE_ARN" \
+        --wait --timeout 300s
+
+      kubectl rollout status daemonset/$FLUENT_BIT_RELEASE -n "$LOGGING_NAMESPACE" --timeout=180s
+      kubectl apply -f kubernetes/observability/servicemonitor-apps.yaml
+      kubectl apply -f kubernetes/observability/servicemonitor-fluent-bit.yaml
+      kubectl apply -f kubernetes/observability/prometheusrules-staging.yaml
+      kubectl apply -f kubernetes/observability/dashboard-staging-overview.yaml
+      kubectl apply -f kubernetes/observability/dashboard-logging-troubleshooting.yaml
+      kubectl apply -f kubernetes/observability/dashboard-system-metrics.yaml
+
+      kubectl rollout status deployment -l app.kubernetes.io/name=grafana -n "$MONITORING_NAMESPACE" --timeout=300s
+      kubectl get pods -n "$MONITORING_NAMESPACE"
+      kubectl get pods -n "$LOGGING_NAMESPACE"
+      echo "✅ Staging kube-prometheus-stack, Loki, Fluent Bit, and dashboards installed"
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_success
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: manual
+      allow_failure: true
+  allow_failure: false
+
+# =============================================================================
+# STAGE 3b: DEPLOY STAGING — kubectl apply + rollout verification
+# =============================================================================
+
+deploy-staging:
+  stage: deploy-staging
+  image: alpine:latest
+  needs:
+    - install-observability-staging
+  before_script:
+    - apk add --no-cache curl bash tar gzip python3 py3-pip sed
+    - pip3 install --break-system-packages awscli
+    # Install kubectl
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    # Install Helm (direct binary download — fallback addon installation)
+    - curl -sL "https://get.helm.sh/helm-v3.17.0-linux-amd64.tar.gz" | tar xz -C /tmp
+    - mv /tmp/linux-amd64/helm /usr/local/bin/
+    # Configure kubeconfig for the staging EKS cluster
+    - aws eks update-kubeconfig --name $STAGING_CLUSTER_NAME --region $AWS_DEFAULT_REGION
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  Deploying to STAGING via kubectl apply"
+    - 'echo "  Image version: ${IMAGE_VERSION}"'
+    - echo "═══════════════════════════════════════════════════════════════"
+    # Ensure ESO is installed (fallback if install-addons-staging was skipped/retried)
+    - |
+      if ! kubectl get crd externalsecrets.external-secrets.io > /dev/null 2>&1; then
+        echo "⚠️  ESO CRDs not found — installing External Secrets Operator as fallback..."
+        STATUS=$(helm status external-secrets -n external-secrets -o json 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+        case "$STATUS" in
+          pending-install|pending-upgrade|pending-rollback)
+            echo "⚠️  External-secrets release is $STATUS — clearing stale operation lock..."
+            helm rollback external-secrets 0 -n external-secrets 2>/dev/null || true
+            helm uninstall external-secrets -n external-secrets 2>/dev/null || true
+            sleep 10
+            ;;
+        esac
+        helm repo add external-secrets https://charts.external-secrets.io
+        helm repo update external-secrets
+        ESO_ROLE_ARN=$(aws iam get-role --role-name yr4-project-staging-eso-role \
+          --query 'Role.Arn' --output text 2>/dev/null || echo "")
+        if [ -z "$ESO_ROLE_ARN" ]; then
+          echo "❌ IAM role yr4-project-staging-eso-role was not found; External Secrets cannot access AWS Secrets Manager"
+          exit 1
+        fi
+        HELM_ARGS="--namespace external-secrets --create-namespace --set installCRDs=true --wait --timeout 300s"
+        HELM_ARGS="$HELM_ARGS --set serviceAccount.create=true --set serviceAccount.name=external-secrets-sa"
+        HELM_ARGS="$HELM_ARGS --set serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=$ESO_ROLE_ARN"
+        for ATTEMPT in 1 2 3 4 5; do
+          if helm upgrade --install external-secrets external-secrets/external-secrets $HELM_ARGS; then
+            break
+          fi
+          if [ "$ATTEMPT" -eq 5 ]; then
+            echo "❌ Failed to install external-secrets after 5 attempts"
+            exit 1
+          fi
+          echo "⚠️  External-secrets install failed (attempt $ATTEMPT/5), retrying in 20s..."
+          sleep 20
+        done
+        echo "✅ ESO installed"
+      else
+        echo "✅ ESO CRDs already available"
+      fi
+      sh scripts/deployment/ensure-external-secret-store.sh
+    # Ensure cert-manager is installed (fallback)
+    - |
+      if ! kubectl get crd certificates.cert-manager.io > /dev/null 2>&1; then
+        echo "⚠️  cert-manager CRDs not found — installing as fallback..."
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo update jetstack
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager --create-namespace \
+          --set crds.enabled=true \
+          --wait --timeout 300s
+        echo "✅ cert-manager installed"
+      else
+        echo "✅ cert-manager CRDs already available"
+      fi
+    # ── Pin images to exact version when triggered by dev repo ──
+    - sh scripts/deployment/pin-images.sh "$IMAGE_VERSION" kubernetes/base/*-deployment.y*ml kubernetes/overlays/staging/migration-job.yaml
+    - kubectl create namespace $STAGING_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+    # Validate the exact rendered overlay before any live mutation that could take staging down.
+    - |
+      echo "Validating staging Kustomize overlay with kubectl before apply..."
+      kubectl kustomize kubernetes/overlays/staging > /tmp/staging-rendered.yaml
+      kubectl apply --dry-run=client --validate=false -k kubernetes/overlays/staging > /dev/null
+      sh scripts/deployment/check-cloudwatch-observability.sh "$STAGING_CLUSTER_NAME"
+    # Sync secrets and run migrations before application rollouts.
+    - kubectl apply -f kubernetes/overlays/staging/external-secrets.yaml -n $STAGING_NAMESPACE
+    - sh scripts/deployment/sync-external-secrets.sh "$STAGING_NAMESPACE" 180
+    - sh scripts/deployment/run-migration-job.sh "$STAGING_NAMESPACE" /tmp/staging-rendered.yaml 300s
+    - kubectl apply --dry-run=server -k kubernetes/overlays/staging > /dev/null
+    # Clean up only failed/stale pods from previous deployments. Do not scale healthy deployments to 0.
+    - |
+      echo "Cleaning up non-running pods from previous deployments..."
+      kubectl delete pods -n $STAGING_NAMESPACE --field-selector=status.phase!=Running --ignore-not-found 2>/dev/null || true
+    - kubectl apply -k kubernetes/overlays/staging
+    # Force ESO to re-sync secrets from AWS (picks up any recent secret value changes)
+    - sh scripts/deployment/sync-external-secrets.sh "$STAGING_NAMESPACE" 180
+    - sh scripts/deployment/wait-deployment-rollout.sh "$STAGING_NAMESPACE" 300
+    - |
+      echo ""
+      echo "Waiting for LoadBalancer external hostname..."
+      for i in $(seq 1 60); do
+        LB_HOST=$(kubectl get svc nginx-gateway -n $STAGING_NAMESPACE \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        LB_IP=$(kubectl get svc nginx-gateway -n $STAGING_NAMESPACE \
+          -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+
+        if [ -n "$LB_HOST" ]; then
+          echo "STAGING_URL=http://$LB_HOST" > staging-deploy.env
+          echo "✅ Staging URL: http://$LB_HOST"
+          break
+        fi
+
+        if [ -n "$LB_IP" ]; then
+          echo "STAGING_URL=http://$LB_IP" > staging-deploy.env
+          echo "✅ Staging URL: http://$LB_IP"
+          break
+        fi
+
+        echo "  Attempt $i/60 — waiting for LB provisioning..."
+        sleep 10
+      done
+      if [ -z "$LB_HOST" ] && [ -z "$LB_IP" ]; then
+        echo "⚠️  LoadBalancer hostname not available yet (may still be provisioning)"
+        kubectl get svc nginx-gateway -n $STAGING_NAMESPACE -o wide || true
+        kubectl describe svc nginx-gateway -n $STAGING_NAMESPACE || true
+        echo "STAGING_URL=" > staging-deploy.env
+      fi
+    - echo ""
+    - echo "✅ Staging deployment complete"
+  artifacts:
+    reports:
+      dotenv: staging-deploy.env
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_success
+  allow_failure: false
+
+# =============================================================================
+# STAGE 4: STAGING READINESS — Post-deploy diagnostics before smoke tests
+# =============================================================================
+
+staging-readiness:
+  stage: staging-readiness
+  image: alpine:latest
+  needs:
+    - deploy-staging
+  before_script:
+    - apk add --no-cache curl bash python3 py3-pip
+    - pip3 install --break-system-packages awscli
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - aws eks update-kubeconfig --name $STAGING_CLUSTER_NAME --region $AWS_DEFAULT_REGION
+  script:
+    - |
+      set -eu
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Readiness — STAGING workloads and services"
+      echo "═══════════════════════════════════════════════════════════════"
+
+      kubectl get nodes -o wide
+      kubectl get pods -n "$STAGING_NAMESPACE" -o wide
+      kubectl get svc -n "$STAGING_NAMESPACE" -o wide
+      kubectl get endpoints -n "$STAGING_NAMESPACE" || true
+
+      sh scripts/deployment/wait-deployment-rollout.sh "$STAGING_NAMESPACE" 300
+
+      BAD_PODS=$(kubectl get pods -n "$STAGING_NAMESPACE" \
+        --field-selector=status.phase!=Succeeded \
+        -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}{"\n"}{end}' 2>/dev/null \
+        | grep -E 'ImagePullBackOff|ErrImagePull|CrashLoopBackOff|CreateContainerConfigError' || true)
+      if [ -n "$BAD_PODS" ]; then
+        echo "❌ Pods are in failing states:"
+        printf '%s\n' "$BAD_PODS"
+        kubectl describe pods -n "$STAGING_NAMESPACE" || true
+        kubectl get events -n "$STAGING_NAMESPACE" --sort-by=.lastTimestamp | tail -100 || true
+        exit 1
+      fi
+
+      NOT_READY=$(kubectl get pods -n "$STAGING_NAMESPACE" --field-selector=status.phase!=Succeeded --no-headers 2>/dev/null \
+        | awk '{ split($2, ready, "/"); if (ready[1] != ready[2] || $3 != "Running") print }' || true)
+      if [ -n "$NOT_READY" ]; then
+        echo "❌ Not all non-completed staging pods are Running and Ready"
+        printf '%s\n' "$NOT_READY"
+        kubectl get pods -n "$STAGING_NAMESPACE" -o wide || true
+        kubectl describe pods -n "$STAGING_NAMESPACE" || true
+        kubectl get events -n "$STAGING_NAMESPACE" --sort-by=.lastTimestamp | tail -100 || true
+        exit 1
+      fi
+
+      kubectl get job migration-runner -n "$STAGING_NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' | grep -q True
+      echo "✅ Migration job completed"
+
+      echo "Recent staging warning events, if any:"
+      kubectl get events -n "$STAGING_NAMESPACE" --field-selector type=Warning --sort-by=.lastTimestamp | tail -30 || true
+      echo "✅ Staging readiness checks passed"
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_success
+  allow_failure: false
+
+# =============================================================================
+# STAGE 5: STAGING TESTS — E2E, load tests, smoke tests
+# =============================================================================
+#
+# All three jobs run in parallel against the staging environment.
+# Playwright E2E and k6 load tests validate the deployment before promotion.
+#
+
+smoke-tests-staging:
+  stage: staging-tests
+  image: alpine:latest
+  needs:
+    - staging-readiness
+    - job: deploy-staging
+      artifacts: true
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  Smoke Tests — Staging Health Checks"
+    - echo "═══════════════════════════════════════════════════════════════"
+    - sh scripts/deployment/smoke-tests.sh "$STAGING_URL" staging
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_success
+  allow_failure: false
+
+# ---------------------------------------------------------------------------
+# PLAYWRIGHT E2E TESTS (Staging)
+# ---------------------------------------------------------------------------
+# Runs browser-based end-to-end tests against the staging environment.
+# Tests live in tests/e2e/ (to be created — see CD_PLAN.md Phase 4).
+#
+# TODO: Add Playwright test suite covering critical user journeys:
+#   - Login / logout / token refresh
+#   - Customer CRUD
+#   - Job scheduling & calendar
+#   - Admin panel access
+# ---------------------------------------------------------------------------
+
+# NOTE: Playwright E2E and k6 load test jobs removed (placeholders).
+# Re-add when test scripts are ready. See CD_PLAN.md Phase 4.
+
+# =============================================================================
+# STAGE 5: DESTROY STAGING — Manual full teardown before production promotion
+# =============================================================================
+# This stage intentionally destroys staging after staging validation succeeds and
+# before production promotion. It lets us prove staging can be torn down and
+# recreated by the pipeline while preserving Terraform bootstrap resources and
+# persistent secrets stored in separate Terraform state.
+
+confirm-destroy-staging:
+  stage: destroy-staging
+  image: alpine:latest
+  needs:
+    - smoke-tests-staging
+  script:
+    - |
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Manual approval: DESTROY STAGING infrastructure"
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "This will trigger a full Terraform destroy for STAGING only."
+      echo "Expected destroyed cost resources: staging EKS, worker nodes, VPC/NAT, RDS, Redis, ELBs, security groups."
+      echo "Expected preserved resources: Terraform S3/DynamoDB bootstrap and persistent secrets state."
+      echo "Production promotion is blocked until staging destroy completes successfully."
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only" && $PIPELINE_MODE != "staging-only"'
+      when: manual
+      allow_failure: false
+
+cleanup-staging-loadbalancers:
+  stage: destroy-staging
+  image: alpine:latest
+  needs:
+    - confirm-destroy-staging
+  before_script:
+    - apk add --no-cache curl bash python3 py3-pip
+    - pip3 install --break-system-packages awscli
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+  script:
+    - |
+      set -eu
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Pre-destroy cleanup (staging): release cloud load balancers"
+      echo "═══════════════════════════════════════════════════════════════"
+
+      if ! aws eks describe-cluster --name "$STAGING_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION" > /dev/null 2>&1; then
+        echo "ℹ️  Staging cluster does not exist. Nothing to clean up."
+        exit 0
+      fi
+
+      aws eks update-kubeconfig --name "$STAGING_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
+
+      LB_SERVICES=$(kubectl get svc --all-namespaces -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+      if [ -n "$LB_SERVICES" ]; then
+        echo "Deleting LoadBalancer services across all staging cluster namespaces to release cloud load balancers..."
+        printf '%s\n' "$LB_SERVICES" | while read -r NS SVC; do
+          [ -n "$NS" ] && [ -n "$SVC" ] || continue
+          echo "  Deleting service: $NS/$SVC"
+          kubectl delete svc "$SVC" -n "$NS" --wait=true --timeout=180s || true
+        done
+      else
+        echo "ℹ️  No LoadBalancer services found in the staging cluster."
+      fi
+
+      VPC_ID=$(aws eks describe-cluster --name "$STAGING_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION" \
+        --query 'cluster.resourcesVpcConfig.vpcId' --output text)
+      echo "Staging VPC: $VPC_ID"
+
+      echo "Cleaning any remaining ALB/NLB in staging VPC..."
+      for ARN in $(aws elbv2 describe-load-balancers --region "$AWS_DEFAULT_REGION" \
+        --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" --output text); do
+        [ -n "$ARN" ] || continue
+        echo "  Deleting ELBv2: $ARN"
+        aws elbv2 delete-load-balancer --region "$AWS_DEFAULT_REGION" --load-balancer-arn "$ARN" || true
+      done
+
+      echo "Cleaning any remaining Classic ELB in staging VPC..."
+      for NAME in $(aws elb describe-load-balancers --region "$AWS_DEFAULT_REGION" \
+        --query "LoadBalancerDescriptions[?VPCId=='$VPC_ID'].LoadBalancerName" --output text); do
+        [ -n "$NAME" ] || continue
+        echo "  Deleting Classic ELB: $NAME"
+        aws elb delete-load-balancer --region "$AWS_DEFAULT_REGION" --load-balancer-name "$NAME" || true
+      done
+
+      echo "Waiting up to 15 minutes for ELB network interfaces to drain..."
+      for ATTEMPT in $(seq 1 90); do
+        ENI_COUNT=$(aws ec2 describe-network-interfaces --region "$AWS_DEFAULT_REGION" \
+          --filters "Name=vpc-id,Values=$VPC_ID" \
+          --query "length(NetworkInterfaces[?RequesterManaged==\`true\` && contains(Description, 'ELB')])" \
+          --output text)
+        if [ "$ENI_COUNT" = "0" ]; then
+          echo "✅ No ELB-managed ENIs remain in staging VPC."
+          exit 0
+        fi
+        if [ "$ATTEMPT" -eq 1 ] || [ "$((ATTEMPT % 12))" -eq 0 ]; then
+          echo "  ELB-managed ENIs still present: $ENI_COUNT (attempt $ATTEMPT/90)"
+        fi
+        sleep 10
+      done
+
+      echo "❌ Timed out waiting for ELB ENIs to drain from staging VPC."
+      echo "Diagnostics:"
+      aws ec2 describe-network-interfaces --region "$AWS_DEFAULT_REGION" \
+        --filters "Name=vpc-id,Values=$VPC_ID" \
+        --query "NetworkInterfaces[?RequesterManaged==\`true\` && contains(Description, 'ELB')].{Id:NetworkInterfaceId,Status:Status,Description:Description,Subnet:SubnetId}" \
+        --output table || true
+      aws elbv2 describe-load-balancers --region "$AWS_DEFAULT_REGION" \
+        --query "LoadBalancers[?VpcId=='$VPC_ID'].{Name:LoadBalancerName,Type:Type,State:State.Code}" \
+        --output table || true
+      aws elb describe-load-balancers --region "$AWS_DEFAULT_REGION" \
+        --query "LoadBalancerDescriptions[?VPCId=='$VPC_ID'].{Name:LoadBalancerName,Scheme:Scheme}" \
+        --output table || true
+      exit 1
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only" && $PIPELINE_MODE != "staging-only"'
+      when: on_success
+      allow_failure: false
+
+trigger-destroy-staging:
+  stage: destroy-staging
+  needs:
+    - cleanup-staging-loadbalancers
+  trigger:
+    project: finalproject/Prototypes/yr4-projectinfrarepo
+    strategy: depend
+  variables:
+    DESTROY_ENV: "staging"
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only" && $PIPELINE_MODE != "staging-only"'
+      when: on_success
+      allow_failure: false
+
+verify-staging-destroyed:
+  stage: verify-destroy
+  image: alpine:latest
+  needs:
+    - trigger-destroy-staging
+  before_script:
+    - apk add --no-cache bash python3 py3-pip
+    - pip3 install --break-system-packages awscli
+  script:
+    - sh scripts/deployment/verify-staging-destroyed.sh
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only" && $PIPELINE_MODE != "staging-only"'
+      when: on_success
+      allow_failure: false
+
+# =============================================================================
+# STAGE 6: PROMOTE — Manual approval to deploy to production
+# =============================================================================
+#
+# Same manual gate pattern as the dev repo's trigger-deploy stage.
+# Updates the production overlay version label and commits back to repo.
+# The pipeline waits for manual approval before deploying to production.
+
+promote-to-production:
+  stage: promote
+  image: alpine:latest
+  needs:
+    - verify-staging-destroyed
+  before_script:
+    - apk add --no-cache git sed
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  Promoting ${IMAGE_VERSION} to PRODUCTION"
+    - echo "═══════════════════════════════════════════════════════════════"
+    - |
+      git fetch origin main
+      git checkout -B main origin/main
+      cd kubernetes/overlays/production
+      if ! grep -q 'app.kubernetes.io/version:' kustomization.yaml; then
+        echo "❌ Production overlay is missing app.kubernetes.io/version label"
+        exit 1
+      fi
+      sed -i "s|app.kubernetes.io/version: .*|app.kubernetes.io/version: \"${IMAGE_VERSION}\"|" kustomization.yaml
+      if ! grep -q "app.kubernetes.io/version: \"${IMAGE_VERSION}\"" kustomization.yaml; then
+        echo "❌ Failed to update production version label"
+        exit 1
+      fi
+      cd "$CI_PROJECT_DIR"
+    - git config user.email "cd-pipeline@gitlab.ci"
+    - git config user.name "CD Pipeline"
+    - git add kubernetes/overlays/production/kustomization.yaml
+    - 'git commit -m "ci: promote ${IMAGE_VERSION} to production [skip ci] - Source: ${SOURCE_COMMIT}" || echo "No changes to commit"'
+    - |
+      # Push with a token that can write to this repository.
+      # Prefer GITLAB_PUSH_TOKEN so GITLAB_API_TOKEN can stay API-only for infra polling.
+      if [ -n "$GITLAB_PUSH_TOKEN" ]; then
+        PUSH_USER="${GITLAB_PUSH_USER:-oauth2}"
+        PUSH_URL="https://${PUSH_USER}:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      elif [ -n "$GITLAB_API_TOKEN" ]; then
+        echo "WARNING: GITLAB_PUSH_TOKEN is not set; using legacy GITLAB_API_TOKEN for repository push."
+        echo "         This token must have write_repository scope."
+        PUSH_USER="${GITLAB_PUSH_USER:-oauth2}"
+        PUSH_URL="https://${PUSH_USER}:${GITLAB_API_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      else
+        echo "WARNING: GITLAB_PUSH_TOKEN not set; falling back to CI_JOB_TOKEN."
+        echo "         If push fails, enable CI job-token push for this project"
+        echo "         or set GITLAB_PUSH_TOKEN with write_repository scope."
+        PUSH_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      fi
+      for ATTEMPT in 1 2 3; do
+        PUSH_STATUS=0
+        PUSH_OUTPUT="$(git push "$PUSH_URL" HEAD:main 2>&1)" || PUSH_STATUS=$?
+        echo "$PUSH_OUTPUT"
+
+        if [ "$PUSH_STATUS" -eq 0 ]; then
+          echo "✅ Push succeeded on attempt $ATTEMPT"
+          break
+        fi
+
+        case "$PUSH_OUTPUT" in
+          *"HTTP Basic: Access denied"*|*"Authentication failed"*|*"not allowed to push"*|*"403"*)
+            echo "ERROR: Git push authentication failed."
+            echo "Set GITLAB_PUSH_TOKEN to a non-expired personal/project access token with write_repository scope."
+            echo "If you use a project access token, set GITLAB_PUSH_USER to that token's username if oauth2 is rejected."
+            echo "Alternatively, enable CI_JOB_TOKEN push access for this project and leave GITLAB_PUSH_TOKEN unset."
+            exit "$PUSH_STATUS"
+            ;;
+        esac
+
+        if [ "$ATTEMPT" -eq 3 ]; then
+          echo "❌ Push failed after 3 attempts (likely sustained write race)."
+          exit 1
+        fi
+
+        echo "⚠️  Push rejected (non-fast-forward). Rebasing on latest main and retrying..."
+        if ! FETCH_OUTPUT="$(git fetch "$PUSH_URL" main 2>&1)"; then
+          echo "$FETCH_OUTPUT"
+          echo "ERROR: Could not fetch latest main before retrying push."
+          exit 1
+        fi
+        git rebase FETCH_HEAD
+      done
+    - echo ""
+    - echo "✅ Production overlay updated — kubectl deploy will proceed next"
+  rules:
+    - if: '$IMAGE_VERSION && ($PIPELINE_MODE == "auto" || $PIPELINE_MODE == "full-release")'
+      when: manual
+      allow_failure: false
+
+# =============================================================================
+# STAGE 7a: ENSURE PRODUCTION — Trigger infra repo to bring production cluster up
+# =============================================================================
+# Same cross-project trigger pattern as staging. Fires after manual promotion
+# is approved. The infra repo creates/scales the production cluster, and the
+# CD pipeline waits for it to finish before deploying.
+
+trigger-infra-production:
+  stage: ensure-production
+  needs:
+    - promote-to-production
+  trigger:
+    project: finalproject/Prototypes/yr4-projectinfrarepo
+    strategy: depend
+  variables:
+    ENSURE_UP: "true"
+    TARGET_ENV: "production"
+  rules:
+    - if: '$IMAGE_VERSION && ($PIPELINE_MODE == "auto" || $PIPELINE_MODE == "full-release")'
+      when: on_success
+
+wait-production-ready:
+  stage: ensure-production
+  image: alpine:latest
+  needs:
+    - trigger-infra-production
+  before_script:
+    - apk add --no-cache curl bash python3 py3-pip
+    - pip3 install --break-system-packages awscli
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+  script:
+    - |
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Verifying PRODUCTION cluster readiness after infra trigger"
+      echo "═══════════════════════════════════════════════════════════════"
+
+      if ! aws eks describe-cluster --name $PROD_CLUSTER_NAME --region $AWS_DEFAULT_REGION > /dev/null 2>&1; then
+        echo "❌ Production cluster still does not exist after infra trigger."
+        echo "   Check the infra repo pipeline for errors."
+        exit 1
+      fi
+
+      DESIRED=$(aws eks describe-nodegroup \
+        --cluster-name $PROD_CLUSTER_NAME \
+        --nodegroup-name $PROD_NODE_GROUP \
+        --region $AWS_DEFAULT_REGION \
+        --query 'nodegroup.scalingConfig.desiredSize' \
+        --output text 2>/dev/null || echo "0")
+
+      if [ "$DESIRED" = "0" ] || [ "$DESIRED" = "None" ]; then
+        echo "❌ Production nodes still at 0 after infra trigger."
+        exit 1
+      fi
+
+      echo "✅ Production node group ready — $DESIRED node(s) desired."
+
+      # Wait for K8s API to become reachable (up to 10 minutes)
+      aws eks update-kubeconfig --name $PROD_CLUSTER_NAME --region $AWS_DEFAULT_REGION
+
+      echo "Waiting for Kubernetes API to become reachable..."
+      API_ENDPOINT=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+      echo "  API endpoint: $API_ENDPOINT"
+
+      for ATTEMPT in $(seq 1 40); do
+        if kubectl --request-timeout=15s get --raw=/readyz >/dev/null 2>&1; then
+          echo "✅ Kubernetes API is reachable (attempt $ATTEMPT/40)"
+          exit 0
+        fi
+        if [ "$ATTEMPT" -eq 1 ] || [ "$((ATTEMPT % 5))" -eq 0 ]; then
+          echo "  Diagnostic (attempt $ATTEMPT/40):"
+          kubectl --request-timeout=10s get --raw=/readyz 2>&1 || true
+        else
+          echo "  ⚠️  API not reachable yet (attempt $ATTEMPT/40), retrying in 15s..."
+        fi
+        sleep 15
+      done
+
+      echo "❌ Kubernetes API not reachable after 10 minutes"
+      echo ""
+      echo "Diagnostics:"
+      echo "── Cluster status ──"
+      aws eks describe-cluster --name $PROD_CLUSTER_NAME --region $AWS_DEFAULT_REGION \
+        --query 'cluster.{Status:status,Endpoint:endpoint,PlatformVersion:platformVersion}' --output table || true
+      echo "── Node group status ──"
+      aws eks describe-nodegroup --cluster-name $PROD_CLUSTER_NAME --nodegroup-name $PROD_NODE_GROUP --region $AWS_DEFAULT_REGION \
+        --query 'nodegroup.{Status:status,DesiredSize:scalingConfig.desiredSize,Health:health}' --output table || true
+      echo "── DNS resolution ──"
+      nslookup $(echo $API_ENDPOINT | sed 's|https://||') 2>&1 || echo "DNS resolution failed"
+      echo "── curl to API endpoint ──"
+      curl -sk --connect-timeout 10 --max-time 15 "${API_ENDPOINT}/readyz" 2>&1 | head -20 || echo "curl failed"
+      exit 1
+  rules:
+    - if: '$IMAGE_VERSION && ($PIPELINE_MODE == "auto" || $PIPELINE_MODE == "full-release")'
+      when: on_success
+  allow_failure: false
+
+# =============================================================================
+# STAGE 7b: INSTALL CLUSTER ADD-ONS — cert-manager, ESO, NGINX Ingress (PROD)
+# =============================================================================
+
+install-addons-production:
+  stage: deploy-prod
+  image: alpine:latest
+  resource_group: production-cluster-addons
+  needs:
+    - wait-production-ready
+  before_script:
+    - apk add --no-cache curl bash tar gzip python3 py3-pip
+    - pip3 install --break-system-packages awscli
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - curl -sL "https://get.helm.sh/helm-v3.17.0-linux-amd64.tar.gz" | tar xz -C /tmp
+    - mv /tmp/linux-amd64/helm /usr/local/bin/
+    - |
+      for ATTEMPT in 1 2 3; do
+        if aws eks update-kubeconfig --name $PROD_CLUSTER_NAME --region $AWS_DEFAULT_REGION; then
+          break
+        fi
+        if [ "$ATTEMPT" -eq 3 ]; then
+          echo "❌ Failed to configure kubeconfig after 3 attempts"
+          exit 1
+        fi
+        echo "⚠️  update-kubeconfig failed (attempt $ATTEMPT/3), retrying in 10s..."
+        sleep 10
+      done
+  script:
+    - |
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Installing cluster add-ons for PRODUCTION"
+      echo "═══════════════════════════════════════════════════════════════"
+
+      retry_cmd() {
+        ATTEMPTS=$1
+        DELAY=$2
+        shift 2
+        TRY=1
+        until "$@"; do
+          if [ "$TRY" -ge "$ATTEMPTS" ]; then
+            echo "❌ Command failed after ${ATTEMPTS} attempts: $*"
+            return 1
+          fi
+          echo "⚠️  Command failed (attempt ${TRY}/${ATTEMPTS}): $*"
+          echo "   Retrying in ${DELAY}s..."
+          sleep "$DELAY"
+          TRY=$((TRY + 1))
+        done
+      }
+
+      wait_for_k8s_api() {
+        ATTEMPTS=$1
+        DELAY=$2
+        TRY=1
+        while [ "$TRY" -le "$ATTEMPTS" ]; do
+          if kubectl --request-timeout=15s get --raw=/readyz >/dev/null 2>&1; then
+            echo "✅ Kubernetes API reachable (attempt ${TRY}/${ATTEMPTS})"
+            return 0
+          fi
+          if [ "$((TRY % 5))" -eq 0 ]; then
+            echo "⚠️  Kubernetes API not reachable (attempt ${TRY}/${ATTEMPTS}) — error:"
+            kubectl --request-timeout=10s get --raw=/readyz 2>&1 || true
+          else
+            echo "⚠️  Kubernetes API not reachable yet (attempt ${TRY}/${ATTEMPTS}), retrying in ${DELAY}s..."
+          fi
+          sleep "$DELAY"
+          TRY=$((TRY + 1))
+        done
+        echo "❌ Kubernetes API not reachable after ${ATTEMPTS} checks"
+        echo "── Final diagnostic ──"
+        kubectl --request-timeout=10s cluster-info 2>&1 || true
+        return 1
+      }
+
+      clear_pending_helm_release() {
+        RELEASE=$1
+        NAMESPACE=$2
+        STATUS=$(helm status "$RELEASE" -n "$NAMESPACE" -o json 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+        case "$STATUS" in
+          pending-install|pending-upgrade|pending-rollback)
+            echo "⚠️  Helm release $RELEASE in $NAMESPACE is $STATUS — clearing stale operation lock..."
+            helm rollback "$RELEASE" 0 -n "$NAMESPACE" 2>/dev/null || true
+            helm uninstall "$RELEASE" -n "$NAMESPACE" 2>/dev/null || true
+            sleep 10
+            ;;
+        esac
+      }
+
+      wait_for_k8s_api 30 15
+
+      ESO_ROLE_ARN=$(aws iam get-role \
+        --role-name yr4-project-production-eso-role \
+        --query 'Role.Arn' --output text)
+      echo "ESO Role ARN: $ESO_ROLE_ARN"
+
+      # 1. cert-manager
+      echo "--- Installing cert-manager ---"
+      retry_cmd 4 10 helm repo add jetstack https://charts.jetstack.io
+      retry_cmd 4 10 helm repo update jetstack
+      clear_pending_helm_release cert-manager cert-manager
+      # Pre-install CRDs to avoid startupapicheck deadlock on fresh clusters
+      echo "  Applying cert-manager CRDs..."
+      retry_cmd 4 15 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.7/cert-manager.crds.yaml
+      retry_cmd 4 20 helm upgrade --install cert-manager jetstack/cert-manager \
+        --version 1.14.7 \
+        --namespace cert-manager --create-namespace \
+        --set crds.enabled=true \
+        --set startupapicheck.enabled=false \
+        --wait --timeout 300s
+
+      # 2. External Secrets Operator
+      echo "--- Installing External Secrets Operator ---"
+      retry_cmd 4 10 helm repo add external-secrets https://charts.external-secrets.io
+      retry_cmd 4 10 helm repo update external-secrets
+      clear_pending_helm_release external-secrets external-secrets
+      retry_cmd 10 30 helm upgrade --install external-secrets external-secrets/external-secrets \
+        --namespace external-secrets --create-namespace \
+        --set installCRDs=true \
+        --set serviceAccount.create=true \
+        --set serviceAccount.name=external-secrets-sa \
+        --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$ESO_ROLE_ARN" \
+        --wait --timeout 300s
+
+      sh scripts/deployment/ensure-external-secret-store.sh
+
+      # 3. NGINX Ingress Controller
+      echo "--- Installing NGINX Ingress Controller ---"
+      retry_cmd 4 10 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+      retry_cmd 4 10 helm repo update ingress-nginx
+      helm status ingress-nginx -n ingress-nginx 2>/dev/null \
+        && STATUS=$(helm status ingress-nginx -n ingress-nginx -o json | grep -o '"status":"[^"]*"' | head -1) \
+        || STATUS=""
+      if echo "$STATUS" | grep -q 'failed\|pending-'; then
+        echo "  Previous release in bad state ($STATUS) — rolling back..."
+        helm rollback ingress-nginx 0 -n ingress-nginx 2>/dev/null || helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
+      fi
+      retry_cmd 4 20 helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+        --namespace ingress-nginx --create-namespace \
+        --atomic --timeout 900s
+
+      echo ""
+      echo "✅ All production add-ons installed successfully"
+  rules:
+    - if: '$IMAGE_VERSION && ($PIPELINE_MODE == "auto" || $PIPELINE_MODE == "full-release")'
+      when: on_success
+  allow_failure: false
+
+install-observability-production:
+  stage: deploy-prod
+  image: alpine:latest
+  resource_group: production-observability
+  needs:
+    - install-addons-production
+  before_script:
+    - apk add --no-cache curl bash tar gzip python3 py3-pip
+    - pip3 install --break-system-packages awscli
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    - curl -sL "https://get.helm.sh/helm-v3.17.0-linux-amd64.tar.gz" | tar xz -C /tmp
+    - mv /tmp/linux-amd64/helm /usr/local/bin/
+    - aws eks update-kubeconfig --name $PROD_CLUSTER_NAME --region $AWS_DEFAULT_REGION
+  script:
+    - |
+      echo "═══════════════════════════════════════════════════════════════"
+      echo "  Installing observability foundation for PRODUCTION"
+      echo "═══════════════════════════════════════════════════════════════"
+
+      kubectl apply -f kubernetes/observability/storageclass-gp3.yaml
+
+      sh scripts/deployment/check-cloudwatch-observability.sh "$PROD_CLUSTER_NAME"
+
+      FLUENT_BIT_ROLE_ARN="${FLUENT_BIT_ROLE_ARN:-$(aws iam get-role \
+        --role-name yr4-project-production-fluent-bit-role \
+        --query 'Role.Arn' --output text)}"
+      echo "Fluent Bit Role ARN: $FLUENT_BIT_ROLE_ARN"
+
+      helm upgrade --install "$FLUENT_BIT_RELEASE" helm/fluent-bit \
+        -f helm/fluent-bit/values-prod.yaml \
+        --namespace "$LOGGING_NAMESPACE" --create-namespace \
+        --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$FLUENT_BIT_ROLE_ARN" \
+        --wait --timeout 300s
+
+      kubectl rollout status daemonset/$FLUENT_BIT_RELEASE -n "$LOGGING_NAMESPACE" --timeout=180s
+      echo "✅ Production observability foundation installed"
+  rules:
+    - if: '$IMAGE_VERSION && ($PIPELINE_MODE == "auto" || $PIPELINE_MODE == "full-release")'
+      when: on_success
+  allow_failure: false
+
+# =============================================================================
+# STAGE 6b: DEPLOY PRODUCTION — kubectl apply + rollout verification
+# =============================================================================
+
+deploy-production:
+  stage: deploy-prod
+  image: alpine:latest
+  needs:
+    - install-observability-production
+  before_script:
+    - apk add --no-cache curl bash tar gzip python3 py3-pip sed
+    - pip3 install --break-system-packages awscli
+    # Install kubectl
+    - curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+    # Install Helm (direct binary download — fallback addon installation)
+    - curl -sL "https://get.helm.sh/helm-v3.17.0-linux-amd64.tar.gz" | tar xz -C /tmp
+    - mv /tmp/linux-amd64/helm /usr/local/bin/
+    # Configure kubeconfig for the production EKS cluster
+    - aws eks update-kubeconfig --name $PROD_CLUSTER_NAME --region $AWS_DEFAULT_REGION
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  Deploying to PRODUCTION via kubectl apply"
+    - 'echo "  Image version: ${IMAGE_VERSION}"'
+    - echo "═══════════════════════════════════════════════════════════════"
+    # Ensure ESO is installed (fallback if install-addons-production was skipped/retried)
+    - |
+      if ! kubectl get crd externalsecrets.external-secrets.io > /dev/null 2>&1; then
+        echo "⚠️  ESO CRDs not found — installing External Secrets Operator as fallback..."
+        STATUS=$(helm status external-secrets -n external-secrets -o json 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+        case "$STATUS" in
+          pending-install|pending-upgrade|pending-rollback)
+            echo "⚠️  External-secrets release is $STATUS — clearing stale operation lock..."
+            helm rollback external-secrets 0 -n external-secrets 2>/dev/null || true
+            helm uninstall external-secrets -n external-secrets 2>/dev/null || true
+            sleep 10
+            ;;
+        esac
+        helm repo add external-secrets https://charts.external-secrets.io
+        helm repo update external-secrets
+        ESO_ROLE_ARN=$(aws iam get-role --role-name yr4-project-production-eso-role \
+          --query 'Role.Arn' --output text 2>/dev/null || echo "")
+        if [ -z "$ESO_ROLE_ARN" ]; then
+          echo "❌ IAM role yr4-project-production-eso-role was not found; External Secrets cannot access AWS Secrets Manager"
+          exit 1
+        fi
+        HELM_ARGS="--namespace external-secrets --create-namespace --set installCRDs=true --wait --timeout 300s"
+        HELM_ARGS="$HELM_ARGS --set serviceAccount.create=true --set serviceAccount.name=external-secrets-sa"
+        HELM_ARGS="$HELM_ARGS --set serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=$ESO_ROLE_ARN"
+        for ATTEMPT in 1 2 3 4 5; do
+          if helm upgrade --install external-secrets external-secrets/external-secrets $HELM_ARGS; then
+            break
+          fi
+          if [ "$ATTEMPT" -eq 5 ]; then
+            echo "❌ Failed to install external-secrets after 5 attempts"
+            exit 1
+          fi
+          echo "⚠️  External-secrets install failed (attempt $ATTEMPT/5), retrying in 20s..."
+          sleep 20
+        done
+        echo "✅ ESO installed"
+      else
+        echo "✅ ESO CRDs already available"
+      fi
+      sh scripts/deployment/ensure-external-secret-store.sh
+    # Ensure cert-manager is installed (fallback)
+    - |
+      if ! kubectl get crd certificates.cert-manager.io > /dev/null 2>&1; then
+        echo "⚠️  cert-manager CRDs not found — installing as fallback..."
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo update jetstack
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager --create-namespace \
+          --set crds.enabled=true \
+          --wait --timeout 300s
+        echo "✅ cert-manager installed"
+      else
+        echo "✅ cert-manager CRDs already available"
+      fi
+    # ── Pin images to exact version when triggered by dev repo ──
+    - sh scripts/deployment/pin-images.sh "$IMAGE_VERSION" kubernetes/base/*-deployment.y*ml
+    - sh scripts/deployment/pin-images.sh "$IMAGE_VERSION" kubernetes/overlays/production/migration-job.yaml
+    - kubectl create namespace $PROD_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+    - |
+      echo "Validating production Kustomize overlay with kubectl before apply..."
+      kubectl kustomize kubernetes/overlays/production > /tmp/production-rendered.yaml
+      kubectl apply --dry-run=client --validate=false -k kubernetes/overlays/production > /dev/null
+    # Sync secrets and run migrations before application rollouts.
+    - kubectl apply -f kubernetes/overlays/production/external-secrets.yaml -n $PROD_NAMESPACE
+    - sh scripts/deployment/sync-external-secrets.sh "$PROD_NAMESPACE" 180
+    - sh scripts/deployment/run-migration-job.sh "$PROD_NAMESPACE" /tmp/production-rendered.yaml 300s
+    - kubectl apply --dry-run=server -k kubernetes/overlays/production > /dev/null
+    - kubectl apply -k kubernetes/overlays/production
+    # Force ESO to re-sync secrets from AWS before checking rollouts
+    - sh scripts/deployment/sync-external-secrets.sh "$PROD_NAMESPACE" 180
+    - sh scripts/deployment/wait-deployment-rollout.sh "$PROD_NAMESPACE" 300
+    - |
+      echo ""
+      echo "Waiting for LoadBalancer external hostname..."
+      for i in $(seq 1 60); do
+        LB_HOST=$(kubectl get svc nginx-gateway -n $PROD_NAMESPACE \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        LB_IP=$(kubectl get svc nginx-gateway -n $PROD_NAMESPACE \
+          -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+
+        if [ -n "$LB_HOST" ]; then
+          echo "PROD_URL=http://$LB_HOST" > production-deploy.env
+          echo "✅ Production URL: http://$LB_HOST"
+          break
+        fi
+
+        if [ -n "$LB_IP" ]; then
+          echo "PROD_URL=http://$LB_IP" > production-deploy.env
+          echo "✅ Production URL: http://$LB_IP"
+          break
+        fi
+
+        echo "  Attempt $i/60 — waiting for LB provisioning..."
+        sleep 10
+      done
+      if [ -z "$LB_HOST" ] && [ -z "$LB_IP" ]; then
+        echo "⚠️  LoadBalancer hostname not available yet"
+        kubectl get svc nginx-gateway -n $PROD_NAMESPACE -o wide || true
+        kubectl describe svc nginx-gateway -n $PROD_NAMESPACE || true
+        echo "PROD_URL=" > production-deploy.env
+      fi
+    - echo ""
+    - echo "✅ Production deployment complete"
+  artifacts:
+    reports:
+      dotenv: production-deploy.env
+  rules:
+    - if: '$IMAGE_VERSION && ($PIPELINE_MODE == "auto" || $PIPELINE_MODE == "full-release")'
+      when: on_success
+  allow_failure: false
+
+# =============================================================================
+# STAGE 7: PRODUCTION VALIDATION — Post-deploy smoke tests
+# =============================================================================
+
+smoke-tests-production:
+  stage: prod-validation
+  image: alpine:latest
+  needs:
+    - deploy-production
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  Production Smoke Tests — Health Checks"
+    - echo "═══════════════════════════════════════════════════════════════"
+    - sh scripts/deployment/smoke-tests.sh "$PROD_URL" production
+  rules:
+    - if: '$IMAGE_VERSION && ($PIPELINE_MODE == "auto" || $PIPELINE_MODE == "full-release")'
+      when: on_success
+  allow_failure: false
+
+# =============================================================================
+# STAGE 8: NOTIFY — Deploy result notification
+# =============================================================================
+
+# =============================================================================
+# STAGE 9: NOTIFY — Deploy result notification
+# =============================================================================
+
+notify-success:
+  stage: notify
+  image: alpine:latest
+  needs:
+    - smoke-tests-production
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  ✅ DEPLOYMENT SUCCESSFUL"
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo ""
+    - 'echo "  Environment:  Production"'
+    - 'echo "  Version:      ${IMAGE_VERSION}"'
+    - 'echo "  Source:        ${SOURCE_COMMIT}"'
+    - 'echo "  Pipeline:     ${CI_PIPELINE_URL}"'
+    - echo ""
+    # TODO: Add Slack/Teams/webhook notification
+    # - |
+    #   curl -X POST "$SLACK_WEBHOOK_URL" -H "Content-Type: application/json" \
+    #     -d "{\"text\": \"✅ Production deploy complete — version ${IMAGE_VERSION}\"}"
+  rules:
+    - if: '$IMAGE_VERSION && ($PIPELINE_MODE == "auto" || $PIPELINE_MODE == "full-release")'
+      when: on_success
+  allow_failure: true
+
+notify-failure:
+  stage: notify
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo "  ❌ DEPLOYMENT FAILED"
+    - echo "═══════════════════════════════════════════════════════════════"
+    - echo ""
+    - 'echo "  Environment:  Production"'
+    - 'echo "  Version:      ${IMAGE_VERSION}"'
+    - 'echo "  Pipeline:     ${CI_PIPELINE_URL}"'
+    - echo ""
+    - 'echo "  ACTION REQUIRED: Check deployment logs and kubectl rollout status"'
+    # TODO: Add Slack/Teams/webhook notification
+  rules:
+    - if: '$IMAGE_VERSION && $PIPELINE_MODE != "validate-only"'
+      when: on_failure
+  allow_failure: true
+
+# =============================================================================
+# MANUAL OVERRIDE: SCALE-UP / SCALE-DOWN JOBS
+# =============================================================================
+#
+# Manual-trigger jobs for controlling EKS node groups via AWS CLI.
+# These are independent of the deploy flow — use them from the GitLab UI.
+#
+# Typical workflow (Option C — separate clusters):
+#   1. scale-up-staging    → bring staging nodes up
+#   2. (pipeline deploys)  → validate in staging
+#   3. scale-up-production → bring production nodes up
+#   4. (pipeline deploys)  → canary rollout to production
+#   5. scale-down-staging  → staging no longer needed (auto after prod deploy)
+#   6. (after demo/use)    → scale-down-production
+#
+# EKS control plane (~$0.10/hr) still runs when nodes=0.
+# To fully destroy a cluster, use 'destroy-staging' or 'destroy-production'
+# in the infrastructure repo.
+
+.scale_up_base:
+  stage: manual-ops
+  image:
+    name: amazon/aws-cli:2.22.0
+    entrypoint: [""]
+  script:
+    - |
+      echo "Scaling ${ENV_LABEL} node group to ${DESIRED_SIZE} nodes..."
+      aws eks update-nodegroup-config \
+        --cluster-name ${TARGET_CLUSTER} \
+        --nodegroup-name ${TARGET_NODE_GROUP} \
+        --region $AWS_DEFAULT_REGION \
+        --scaling-config desiredSize=${DESIRED_SIZE},minSize=0,maxSize=${MAX_SIZE}
+
+      echo "Waiting for ${ENV_LABEL} nodes..."
+      aws eks wait nodegroup-active \
+        --cluster-name ${TARGET_CLUSTER} \
+        --nodegroup-name ${TARGET_NODE_GROUP} \
+        --region $AWS_DEFAULT_REGION
+      echo "✅ ${ENV_LABEL} scaled UP"
+  rules:
+    - when: manual
+  allow_failure: true
+
+.scale_down_base:
+  stage: manual-ops
+  image:
+    name: amazon/aws-cli:2.22.0
+    entrypoint: [""]
+  script:
+    - |
+      echo "Scaling ${ENV_LABEL} node group to 0 nodes..."
+      aws eks update-nodegroup-config \
+        --cluster-name ${TARGET_CLUSTER} \
+        --nodegroup-name ${TARGET_NODE_GROUP} \
+        --region $AWS_DEFAULT_REGION \
+        --scaling-config desiredSize=0,minSize=0,maxSize=${MAX_SIZE}
+      echo "✅ ${ENV_LABEL} scaled DOWN"
+  rules:
+    - when: manual
+  allow_failure: true
+
+manual-scale-up-staging:
+  extends: .scale_up_base
+  variables:
+    TARGET_CLUSTER: ${STAGING_CLUSTER_NAME}
+    TARGET_NODE_GROUP: ${STAGING_NODE_GROUP}
+    DESIRED_SIZE: "2"
+    MAX_SIZE: "3"
+    ENV_LABEL: STAGING
+
+manual-scale-down-staging:
+  extends: .scale_down_base
+  variables:
+    TARGET_CLUSTER: ${STAGING_CLUSTER_NAME}
+    TARGET_NODE_GROUP: ${STAGING_NODE_GROUP}
+    MAX_SIZE: "3"
+    ENV_LABEL: STAGING
+
+manual-scale-up-production:
+  extends: .scale_up_base
+  variables:
+    TARGET_CLUSTER: ${PROD_CLUSTER_NAME}
+    TARGET_NODE_GROUP: ${PROD_NODE_GROUP}
+    DESIRED_SIZE: "3"
+    MAX_SIZE: "5"
+    ENV_LABEL: PRODUCTION
+
+manual-scale-down-production:
+  extends: .scale_down_base
+  variables:
+    TARGET_CLUSTER: ${PROD_CLUSTER_NAME}
+    TARGET_NODE_GROUP: ${PROD_NODE_GROUP}
+    MAX_SIZE: "5"
+    ENV_LABEL: PRODUCTION

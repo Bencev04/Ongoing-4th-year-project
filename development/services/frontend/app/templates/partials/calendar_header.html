@@ -1,0 +1,189 @@
+{#
+  Shared Calendar Header Partial
+
+  Rendered by ALL three calendar views (month, week, day) so that
+  navigation, the view-switcher, and the "New Job" button are
+  always present and consistent.
+
+  Template Variables (must be set by every including template):
+  ─────────────────
+  current_view   : str  — "month" | "week" | "day"
+  heading_text   : str  — e.g. "March 2026", "02 Mar – 08 Mar 2026", "Wednesday, 04 March 2026"
+  nav_prev_url   : str  — HTMX URL for prev (month/week/day)
+  nav_next_url   : str  — HTMX URL for next (month/week/day)
+  nav_today_url  : str  — HTMX URL for "Today" in the current view
+  year           : int  — used by view-switcher links
+  month          : int  — used by view-switcher links
+  day            : int  — used by view-switcher Day link (optional, defaults to 1)
+#}
+
+<div class="flex items-center justify-between mb-4 flex-shrink-0">
+    <!-- ── Left: Navigation + Heading ───────────────────────────── -->
+    <div class="flex items-center space-x-5">
+        <div class="inline-flex items-center bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+            <!-- Previous -->
+            <button hx-get="{{ nav_prev_url }}"
+                    hx-target="#calendar-container"
+                    hx-swap="innerHTML"
+                    class="p-2.5 hover:bg-gray-50 transition-colors border-r border-gray-200"
+                    aria-label="Previous">
+                <svg class="h-4 w-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/>
+                </svg>
+            </button>
+
+            <!-- Today -->
+            <button hx-get="{{ nav_today_url }}"
+                    hx-target="#calendar-container"
+                    hx-swap="innerHTML"
+                    class="px-4 py-2 text-sm font-semibold text-gray-600 hover:text-gray-900 hover:bg-gray-50 transition-colors">
+                Today
+            </button>
+
+            <!-- Next -->
+            <button hx-get="{{ nav_next_url }}"
+                    hx-target="#calendar-container"
+                    hx-swap="innerHTML"
+                    class="p-2.5 hover:bg-gray-50 transition-colors border-l border-gray-200"
+                    aria-label="Next">
+                <svg class="h-4 w-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/>
+                </svg>
+            </button>
+        </div>
+
+        <h1 class="text-2xl font-bold text-gray-900 tracking-tight">{{ heading_text }}</h1>
+    </div>
+
+    <!-- ── Right: Filters + View Switcher + New Job ────────────── -->
+    <div class="flex items-center space-x-3">
+
+        <!-- Employee Filter (multi-select with checkboxes) -->
+        {% if employees is defined and employees %}
+        <div class="relative" @click.away="employeeDropdownOpen = false">
+            <button @click="employeeDropdownOpen = !employeeDropdownOpen"
+                    class="flex items-center gap-1.5 text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-400 focus:border-transparent shadow-sm min-w-[10rem]">
+                <span x-text="filterEmployeeIds.length ? filterEmployeeIds.length + ' Employee' + (filterEmployeeIds.length > 1 ? 's' : '') : 'All Employees'" class="truncate"></span>
+                <svg class="w-3.5 h-3.5 text-gray-400 shrink-0 ml-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/>
+                </svg>
+            </button>
+            <div x-show="employeeDropdownOpen" x-transition.opacity
+                 class="absolute top-full mt-1 left-0 w-full bg-white border border-gray-200 rounded-lg shadow-lg z-50 overflow-hidden" @click.stop>
+                <div class="p-1.5 border-b border-gray-100">
+                    <input type="text" x-model="employeeSearch" placeholder="Search employees…"
+                           class="w-full text-sm px-2 py-1 border border-gray-200 rounded focus:outline-none focus:ring-1 focus:ring-primary-400">
+                </div>
+                <div class="max-h-48 overflow-y-auto">
+                    <label @click="filterEmployeeIds = []; refreshCalendar()"
+                           class="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-100 cursor-pointer"
+                           :class="!filterEmployeeIds.length ? 'bg-primary-50 font-medium' : ''">
+                        <input type="checkbox" :checked="!filterEmployeeIds.length" class="rounded border-gray-300 text-primary-600 focus:ring-primary-500 pointer-events-none" tabindex="-1">
+                        All Employees
+                    </label>
+                    {% for emp in employees %}
+                    <label x-show='!employeeSearch || {{ (emp.first_name ~ " " ~ emp.last_name)|tojson }}.toLowerCase().includes(employeeSearch.toLowerCase())'
+                           class="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-100 cursor-pointer"
+                           :class="filterEmployeeIds.includes('{{ emp.id }}') ? 'bg-primary-50 font-medium' : ''">
+                        <input type="checkbox"
+                               :checked="filterEmployeeIds.includes('{{ emp.id }}')"
+                               @change="if ($event.target.checked) { filterEmployeeIds.push('{{ emp.id }}') } else { filterEmployeeIds = filterEmployeeIds.filter(id => id !== '{{ emp.id }}') }; refreshCalendar()"
+                               class="rounded border-gray-300 text-primary-600 focus:ring-primary-500">
+                        {{ emp.first_name }} {{ emp.last_name }}
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        <!-- Customer Filter (multi-select with checkboxes) -->
+        {% if customers is defined and customers %}
+        <div class="relative" @click.away="customerDropdownOpen = false">
+            <button @click="customerDropdownOpen = !customerDropdownOpen"
+                    class="flex items-center gap-1.5 text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-400 focus:border-transparent shadow-sm min-w-[10rem]">
+                <span x-text="filterCustomerIds.length ? filterCustomerIds.length + ' Customer' + (filterCustomerIds.length > 1 ? 's' : '') : 'All Customers'" class="truncate"></span>
+                <svg class="w-3.5 h-3.5 text-gray-400 shrink-0 ml-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/>
+                </svg>
+            </button>
+            <div x-show="customerDropdownOpen" x-transition.opacity
+                 class="absolute top-full mt-1 left-0 w-full bg-white border border-gray-200 rounded-lg shadow-lg z-50 overflow-hidden" @click.stop>
+                <div class="p-1.5 border-b border-gray-100">
+                    <input type="text" x-model="customerSearch" placeholder="Search customers…"
+                           class="w-full text-sm px-2 py-1 border border-gray-200 rounded focus:outline-none focus:ring-1 focus:ring-primary-400">
+                </div>
+                <div class="max-h-48 overflow-y-auto">
+                    <label @click="filterCustomerIds = []; refreshCalendar()"
+                           class="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-100 cursor-pointer"
+                           :class="!filterCustomerIds.length ? 'bg-primary-50 font-medium' : ''">
+                        <input type="checkbox" :checked="!filterCustomerIds.length" class="rounded border-gray-300 text-primary-600 focus:ring-primary-500 pointer-events-none" tabindex="-1">
+                        All Customers
+                    </label>
+                    {% for cust in customers %}
+                    <label x-show='!customerSearch || {{ (cust.first_name ~ " " ~ cust.last_name)|tojson }}.toLowerCase().includes(customerSearch.toLowerCase())'
+                           class="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-100 cursor-pointer"
+                           :class="filterCustomerIds.includes('{{ cust.id }}') ? 'bg-primary-50 font-medium' : ''">
+                        <input type="checkbox"
+                               :checked="filterCustomerIds.includes('{{ cust.id }}')"
+                               @change="if ($event.target.checked) { filterCustomerIds.push('{{ cust.id }}') } else { filterCustomerIds = filterCustomerIds.filter(id => id !== '{{ cust.id }}') }; refreshCalendar()"
+                               class="rounded border-gray-300 text-primary-600 focus:ring-primary-500">
+                        {{ cust.first_name }} {{ cust.last_name }}
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        <!-- View Switcher (pill style) -->
+        <div class="inline-flex bg-gray-100 rounded-xl p-1 shadow-inner" role="group" aria-label="Calendar view">
+            <button type="button"
+                    hx-get="/calendar/container?year={{ year }}&month={{ month }}"
+                    hx-target="#calendar-container"
+                    hx-swap="innerHTML"
+                    class="view-tab px-4 py-1.5 text-sm font-medium rounded-lg transition-all duration-200
+                           {% if current_view == 'month' %}bg-white text-gray-900 shadow-sm{% else %}text-gray-500 hover:text-gray-700{% endif %}">
+                Month
+            </button>
+            <button type="button"
+                    hx-get="/calendar/week?year={{ year }}&month={{ month }}&day={{ day|default(1) }}"
+                    hx-target="#calendar-container"
+                    hx-swap="innerHTML"
+                    class="view-tab px-4 py-1.5 text-sm font-medium rounded-lg transition-all duration-200
+                           {% if current_view == 'week' %}bg-white text-gray-900 shadow-sm{% else %}text-gray-500 hover:text-gray-700{% endif %}">
+                Week
+            </button>
+            <button type="button"
+                    hx-get="/calendar/day-view/{{ '%04d-%02d-%02d'|format(year, month, day|default(1)) }}"
+                    hx-target="#calendar-container"
+                    hx-swap="innerHTML"
+                    class="view-tab px-4 py-1.5 text-sm font-medium rounded-lg transition-all duration-200
+                           {% if current_view == 'day' %}bg-white text-gray-900 shadow-sm{% else %}text-gray-500 hover:text-gray-700{% endif %}">
+                Day
+            </button>
+        </div>
+
+        <!-- New Job (gated by jobs.create permission) -->
+        <button x-show="$store.permissions.canCreateJob" x-cloak
+                hx-get="/calendar/job-modal"
+                hx-target="#modal-container"
+                hx-swap="innerHTML"
+                class="inline-flex items-center px-4 py-2 bg-gradient-to-r from-orange-500 to-orange-600 text-white text-sm font-semibold rounded-xl hover:from-orange-600 hover:to-orange-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-400 shadow-sm hover:shadow-md transition-all duration-200">
+            <svg class="h-4 w-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4"/>
+            </svg>
+            New Job
+        </button>
+
+        <!-- Job Queue Toggle -->
+        <button @click="$store.queue.open = !$store.queue.open" id="nav-job-queue"
+                class="inline-flex items-center justify-center w-10 h-10 rounded-xl border border-gray-200 bg-white text-gray-500 hover:bg-gray-50 hover:text-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-400 shadow-sm hover:shadow-md transition-all duration-200"
+                title="Toggle Job Queue">
+            <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round"
+                      d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+            </svg>
+        </button>
+    </div>
+</div>

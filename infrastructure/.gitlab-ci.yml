@@ -1,0 +1,1127 @@
+# =============================================================================
+# Infrastructure Pipeline — yr4-projectinfrarepo
+# =============================================================================
+#
+# This GitLab CI/CD pipeline manages the entire lifecycle of our AWS infrastructure.
+# It handles validation, planning, applying, scaling, and destroying resources.
+#
+# WHEN DOES IT RUN?
+#   1. Push/MR to this repo   → validate + plan (safe, read-only checks)
+#   2. Merge to main          → apply (creates/updates real AWS resources, MANUAL gate)
+#   3. Cross-project trigger  → ensure-up ONLY (CD repo triggers before deploying)
+#   4. Manual jobs             → scale-up, scale-down, destroy (cost control)
+#
+# CROSS-PROJECT TRIGGER FLOW:
+#   The CD pipeline (yr4-projectdeploymentrepo) needs the cluster to be running
+#   before it can deploy. So it triggers this pipeline with ENSURE_UP=true.
+#   The ensure stage checks the cluster status and scales up if needed.
+#
+#   IMPORTANT: When ENSURE_UP=true, ONLY the ensure-stage jobs run.
+#   All validate/plan/apply/scale/destroy jobs are skipped via
+#   "if: $ENSURE_UP == 'true' → when: never" rules. This prevents
+#   state lock conflicts and unnecessary work during CD-triggered runs.
+#
+# REQUIRED CI/CD VARIABLES (set in GitLab > Settings > CI/CD > Variables):
+#   AWS_ACCESS_KEY_ID       — AWS credentials (masked + protected)
+#   AWS_SECRET_ACCESS_KEY   — AWS credentials (masked + protected)
+#   TF_VAR_rds_username     — Database master username (masked)
+#   TF_VAR_rds_password     — Database master password (masked)
+# =============================================================================
+
+# The pipeline stages run in this order (left to right).
+# Jobs within the same stage run in parallel.
+stages:
+  - validate  # Check formatting and syntax (safe, no AWS calls)
+  - plan      # Show what Terraform WOULD change (read-only AWS calls)
+  - apply     # Actually create/update AWS resources (MANUAL approval!)
+  - ensure    # Make sure cluster is running (triggered by CD repo)
+  - scale     # Manual cost control (scale nodes up or down)
+  - destroy   # Tear down ALL infrastructure (nuclear option)
+
+# =============================================================================
+# Pipeline-wide Variables
+# =============================================================================
+variables:
+  TF_DIR: terraform                  # Directory containing our root Terraform module
+  TF_PLUGIN_CACHE_DIR: "$CI_PROJECT_DIR/.terraform-plugin-cache" # Reuse downloaded providers between CI jobs
+  AWS_DEFAULT_REGION: eu-west-1      # Ireland — must match our provider config
+  GIT_STRATEGY: clone                # Fresh clone each job — avoids stale .git/index.lock from concurrent jobs
+  GIT_CLEAN_FLAGS: -ffdx             # Aggressively clean any leftover files between jobs
+  # Per-environment cluster names (separate clusters for staging and production)
+  STAGING_CLUSTER_NAME: yr4-project-staging-eks
+  STAGING_NODE_GROUP: yr4-project-staging-eks-nodes
+  PROD_CLUSTER_NAME: yr4-project-production-eks
+  PROD_NODE_GROUP: yr4-project-production-eks-nodes
+  # SENSITIVE VARIABLES (set in GitLab CI/CD Settings > Variables as masked + protected):
+  #   AWS_ACCESS_KEY_ID         — IAM user access key
+  #   AWS_SECRET_ACCESS_KEY     — IAM user secret key
+  #   TF_VAR_rds_username       — Postgres master username
+  #   TF_VAR_rds_password       — Postgres master password
+
+cache:
+  key: terraform-plugin-cache
+  paths:
+    - .terraform-plugin-cache/
+  policy: pull-push
+
+# =============================================================================
+# TESTING ARCHITECTURE — Why 10+ Layers of Validation
+# =============================================================================
+#
+# This pipeline implements the "shift-left" security model. The idea is simple:
+# catch issues as EARLY and CHEAPLY as possible — before any AWS resources exist.
+#
+# Every layer below catches a different CLASS of issue. There is minimal overlap:
+#
+# ┌────────────────┬───────────────────┬─────────────────────────────────────────┐
+# │ LAYER          │ TOOL              │ WHAT IT CATCHES                         │
+# ├────────────────┼───────────────────┼─────────────────────────────────────────┤
+# │ Formatting     │ terraform fmt     │ Code style (tabs, alignment, spacing)   │
+# │ Syntax         │ terraform validate│ Invalid HCL, missing variables, types   │
+# │ Linting        │ TFLint + AWS      │ Invalid instance types, deprecations    │
+# │ Security       │ Trivy (SARIF)     │ CIS benchmark misconfigs → Dashboard    │
+# │ Unit Tests     │ terraform test    │ Variable constraints, module wiring     │
+# │ Policy-as-Code │ OPA/Conftest      │ Custom Rego rules (cost, tags, access)  │
+# │ Safety Gate    │ Plan analysis     │ Warns on destructive changes (deletes)  │
+# └────────────────┴───────────────────┴─────────────────────────────────────────┘
+#
+# WHY THESE TOOLS?
+#   - Trivy uses Aqua Security rules (CIS benchmarks)
+#   - OPA enforces OUR project-specific rules no generic scanner knows about
+#   - Plan analysis catches accidental database deletions
+#   - Each tool catches a different CLASS of issue with minimal overlap
+#
+# PERFORMANCE:
+#   All validate-stage jobs run in PARALLEL. Total wall-clock time: ~2-3 minutes.
+#   All tools are free/open-source. Zero licensing cost.
+# =============================================================================
+
+# =============================================================================
+# Shared Job Template — Common setup for all Terraform jobs
+# =============================================================================
+# Uses HashiCorp's official Terraform Docker image.
+# before_script: changes into the terraform/ directory and runs "terraform init"
+# which downloads providers and configures the S3 backend.
+.terraform_base:
+  image:
+    name: hashicorp/terraform:1.9  # Official Terraform image with v1.9
+    entrypoint: [""]              # Override entrypoint so GitLab can run shell scripts
+  before_script:
+    - mkdir -p "$TF_PLUGIN_CACHE_DIR"
+    - cd $TF_DIR               # Enter the terraform/ directory
+    - terraform init -input=false -reconfigure  # Download providers + configure S3 backend
+                                               # -reconfigure handles fresh CI containers with no prior .terraform dir
+
+# Lock-recovery helper script — used by any job that may hit Terraform state locks.
+# Written to /tmp as a standalone script (not a shell function) to avoid GitLab CI's
+# per-step exit monitoring from killing the retry loop on the first terraform failure.
+.lock_recovery:
+  script:
+    - |
+      cat > /tmp/tf_lock_recovery.sh << 'RECOVERY_SCRIPT'
+      #!/bin/sh
+      LOG_FILE="/tmp/tf_error.log"
+      MAX_ATTEMPTS=3
+      ATTEMPT=1
+
+      while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+        { "$@" 2>&1; echo $? > /tmp/tf_exit_code; } | tee "$LOG_FILE"
+        EXIT_CODE=$(cat /tmp/tf_exit_code)
+
+        if [ "$EXIT_CODE" -eq 0 ]; then
+          exit 0
+        fi
+
+        if grep -q "Error acquiring the state lock" "$LOG_FILE"; then
+          LOCK_ID=$(sed -n 's/^[[:space:]]*ID:[[:space:]]*//p' "$LOG_FILE" | head -n 1 | tr -d '\r')
+          if [ -n "$LOCK_ID" ]; then
+            echo "Detected stale lock ID: $LOCK_ID — force-unlocking and retrying..."
+            terraform force-unlock -force "$LOCK_ID" 2>/dev/null || true
+            sleep 5
+            ATTEMPT=$((ATTEMPT + 1))
+            continue
+          fi
+        fi
+
+        exit "$EXIT_CODE"
+      done
+      exit 1
+      RECOVERY_SCRIPT
+      chmod +x /tmp/tf_lock_recovery.sh
+
+# =============================================================================
+# Shared Job Template — Per-environment Terraform jobs
+# =============================================================================
+# Used by per-environment plan/apply/destroy jobs. TARGET_ENV must be set.
+# Changes to the per-environment directory and inits with that env's backend.
+.terraform_env_base:
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]              # Override entrypoint so GitLab can run shell scripts
+  before_script:
+    - mkdir -p "$TF_PLUGIN_CACHE_DIR"
+    - cd terraform/environments/$TARGET_ENV
+    - terraform init -input=false -reconfigure
+    # Install lock-recovery helper (defined in .lock_recovery)
+    - !reference [.lock_recovery, script]
+
+# =============================================================================
+# Stage: validate — Quick checks that run on every push and MR
+# =============================================================================
+# These jobs are SAFE: they don't create or modify any AWS resources.
+# They catch formatting issues and syntax errors before code is merged.
+
+# Job: Check for non-ASCII characters in .tf files
+# AWS APIs reject non-ASCII in many fields (e.g. security group descriptions).
+# This catches the problem at MR time, long before anyone clicks "apply".
+ascii-check:
+  stage: validate
+  image: alpine:3.21
+  script:
+    - |
+      echo "=== Non-ASCII Character Check ==="
+      if LC_ALL=C grep -rn '[^[:print:][:space:]]' modules/ terraform/ --include='*.tf' 2>/dev/null; then
+        echo ""
+        echo "FAILED: Non-ASCII characters found in .tf files (see above)."
+        echo "AWS APIs reject these (e.g. em dashes, smart quotes, BOM markers)."
+        echo "Replace with ASCII equivalents before merging."
+        exit 1
+      fi
+      echo "All .tf files are ASCII-clean."
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Job: Check that all .tf files are properly formatted
+# "terraform fmt -check" returns non-zero if any file needs formatting.
+# The -recursive flag checks all directories (modules, bootstrap, etc.).
+fmt-check:
+  stage: validate
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  script:
+    - terraform fmt -check -recursive .
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"   # Runs on merge requests
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH         # Runs on pushes to main
+
+# Job: Validate Terraform configuration is syntactically correct
+# Checks that all variable references exist, module sources are valid, etc.
+validate:
+  stage: validate
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  before_script:
+    - mkdir -p "$TF_PLUGIN_CACHE_DIR"
+    - cd $TF_DIR
+    - rm -rf .terraform          # Clear any stale state from runner cache
+    - terraform init -input=false -backend=false
+  script:
+    - terraform validate
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# Job: TFLint — Terraform-specific linter with AWS plugin
+# =============================================================================
+# TFLint catches things `terraform validate` misses:
+#   - Invalid AWS instance types (e.g. "t3.nonexistent")
+#   - Deprecated resource attributes
+#   - Naming convention violations
+#   - Variables/outputs missing descriptions
+#
+# Uses the .tflint.hcl config in the repo root.
+tflint:
+  stage: validate
+  image:
+    name: ghcr.io/terraform-linters/tflint:v0.55.0  # Official TFLint image
+    entrypoint: [""]                # Override image entrypoint for GitLab CI
+  before_script:
+    - tflint --init --config .tflint.hcl    # Download the AWS plugin defined in .tflint.hcl
+  script:
+    - tflint --config "$CI_PROJECT_DIR/.tflint.hcl" --recursive  # Scan all modules recursively from repo root
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# Job: Trivy — Security misconfiguration scanner
+# =============================================================================
+# Trivy (by Aqua Security) scans Terraform files against CIS benchmarks and
+# known AWS misconfigurations. It catches issues like:
+#   - Unencrypted storage (RDS, S3, EBS)
+#   - Publicly accessible resources
+#   - Missing security group restrictions
+#   - Overly permissive IAM policies
+#
+# --severity HIGH,CRITICAL → only fail on serious findings (ignore LOW/MEDIUM)
+# --ignorefile → uses .trivyignore for known acceptable findings
+security-scan-trivy:
+  stage: validate
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    # Primary scan: fail the job if HIGH/CRITICAL findings exist
+    - trivy config . --severity HIGH,CRITICAL --exit-code 1 --ignorefile .trivyignore
+    # Secondary scan: generate GitLab-compatible SAST report (all severities).
+    # This populates the Security Dashboard in GitLab's MR widget and the
+    # project-level Security tab — giving a visual overview of all findings.
+    # The "|| true" ensures this reporting step doesn't fail the job.
+    - trivy config . --format template --template "@/contrib/gitlab.tpl" --output gl-sast-report.json --ignorefile .trivyignore || true
+  artifacts:
+    # GitLab auto-detects this report format and shows it in the Security Dashboard.
+    # This is the industry-standard way to surface security findings in GitLab.
+    reports:
+      sast: gl-sast-report.json
+    paths:
+      - gl-sast-report.json
+    expire_in: 30 days
+  allow_failure: false              # Block deployments on HIGH/CRITICAL IaC findings
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# Job: Terraform Test — Native HCL unit tests
+# =============================================================================
+# Uses Terraform's built-in test framework (v1.6+) to run .tftest.hcl files.
+# These tests execute `terraform plan` and assert that:
+#   - Variable defaults are correct
+#   - Module outputs are wired properly
+#   - Security settings match expectations (encryption, access controls)
+#   - Instance types are cost-effective (t3 family only)
+#   - Naming conventions are followed
+#
+# Tests are in terraform/tests/*.tftest.hcl
+terraform-test:
+  stage: validate
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  before_script:
+    - mkdir -p "$TF_PLUGIN_CACHE_DIR"
+    - cd $TF_DIR
+    - rm -rf .terraform          # Clear any stale state from runner cache
+    - terraform init -input=false -backend=false
+  script:
+    - terraform test
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# Job: OPA/Conftest — Policy-as-Code validation
+# =============================================================================
+# This is the MOST ADVANCED validation tier. It works differently from the others:
+#
+# 1. Generate a Terraform plan in JSON format
+# 2. Feed the JSON into Conftest (OPA wrapper)
+# 3. Conftest evaluates our custom Rego policies against the plan
+#
+# Our policies enforce project-specific rules that generic scanners don't cover:
+#   - policy/encryption.rego  → All storage must be encrypted
+#   - policy/network.rego     → Databases must not be publicly accessible
+#   - policy/tagging.rego     → All resources must have required tags
+#   - policy/cost.rego        → Only t3 family instances, no excessive storage
+#
+# This catches violations at the PLAN level, before any resources are created.
+policy-check:
+  extends: .terraform_base          # Uses real backend init (plan needs S3 state)
+  stage: plan                       # Needs AWS creds → runs in plan stage, not validate
+  before_script:
+    - mkdir -p "$TF_PLUGIN_CACHE_DIR"
+    - cd $TF_DIR
+    - rm -rf .terraform
+    - terraform init -input=false -reconfigure  # Full init WITH backend (needs AWS creds)
+    # Install conftest binary (OPA wrapper for testing structured data)
+    - wget -q https://github.com/open-policy-agent/conftest/releases/download/v0.57.0/conftest_0.57.0_Linux_x86_64.tar.gz
+    - tar xzf conftest_0.57.0_Linux_x86_64.tar.gz
+    - mv conftest /usr/local/bin/
+    # Install lock-recovery helper (defined in .lock_recovery)
+    - !reference [.lock_recovery, script]
+  script:
+    # Generate a plan file, then convert it to JSON for OPA to evaluate
+    - sh /tmp/tf_lock_recovery.sh terraform plan -input=false -out=tfplan.binary
+    - terraform show -json tfplan.binary > tfplan.json
+    # Run all Rego policies in the policy/ directory against the plan JSON
+    - conftest test tfplan.json --policy ../policy/ --all-namespaces
+  allow_failure: false              # Block deployments on policy violations
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# Stage: plan — Per-environment Terraform plans
+# =============================================================================
+# Each environment gets its own plan job. These make read-only AWS API calls
+# to compare desired state (code) with actual state (what's in AWS).
+# Plans are saved as CI artifacts so the apply jobs can use them.
+#
+# SEPARATE CLUSTERS:
+#   Staging and production each have their own EKS cluster, RDS, ElastiCache,
+#   VPC, and IAM roles — completely isolated infrastructure.
+
+plan-staging:
+  stage: plan
+  extends: .terraform_env_base
+  resource_group: terraform-staging
+  variables:
+    TARGET_ENV: staging
+  script:
+    - sh /tmp/tf_lock_recovery.sh terraform plan -input=false -out=tfplan
+    - terraform show -no-color tfplan > plan_output.txt
+    - terraform show -json tfplan > tfplan.json
+  artifacts:
+    paths:
+      - terraform/environments/staging/tfplan
+      - terraform/environments/staging/plan_output.txt
+      - terraform/environments/staging/tfplan.json
+    expire_in: 7 days
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+plan-production:
+  stage: plan
+  extends: .terraform_env_base
+  resource_group: terraform-production
+  variables:
+    TARGET_ENV: production
+  script:
+    - sh /tmp/tf_lock_recovery.sh terraform plan -input=false -out=tfplan
+    - terraform show -no-color tfplan > plan_output.txt
+    - terraform show -json tfplan > tfplan.json
+  artifacts:
+    paths:
+      - terraform/environments/production/tfplan
+      - terraform/environments/production/plan_output.txt
+      - terraform/environments/production/tfplan.json
+    expire_in: 7 days
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# Job: Plan Safety Analysis — Destructive change detection (per environment)
+# =============================================================================
+# Inspects the plan output for dangerous operations. Blocks if database or
+# cache resources would be destroyed. Runs for BOTH environments in parallel.
+
+.plan-safety-template:
+  stage: plan
+  image: alpine:3.21
+  script:
+    - |
+      apk add --no-cache jq >/dev/null
+      echo "=== Plan Safety Analysis ($TARGET_ENV) ==="
+      PLAN_JSON="terraform/environments/$TARGET_ENV/tfplan.json"
+      PLAN_TEXT="terraform/environments/$TARGET_ENV/plan_output.txt"
+
+      if [ ! -s "$PLAN_JSON" ]; then
+        echo "CRITICAL: Missing Terraform plan JSON artifact: $PLAN_JSON"
+        exit 1
+      fi
+
+      CHANGE_COUNT=$(jq '[.resource_changes[]? | select(.change.actions != ["no-op"])] | length' "$PLAN_JSON")
+
+      if [ "$CHANGE_COUNT" -eq 0 ]; then
+        echo "No changes detected — $TARGET_ENV infrastructure is up to date."
+        exit 0
+      fi
+
+      CREATES=$(jq '[.resource_changes[]? | select((.change.actions | index("create")) and ((.change.actions | index("delete")) | not))] | length' "$PLAN_JSON")
+      UPDATES=$(jq '[.resource_changes[]? | select(.change.actions == ["update"])] | length' "$PLAN_JSON")
+      REPLACES=$(jq '[.resource_changes[]? | select((.change.actions | index("delete")) and (.change.actions | index("create")))] | length' "$PLAN_JSON")
+      DESTROYS=$(jq '[.resource_changes[]? | select(.change.actions == ["delete"])] | length' "$PLAN_JSON")
+
+      echo "$TARGET_ENV Change Summary: +${CREATES} created | ~${UPDATES} updated | +/-${REPLACES} replaced | -${DESTROYS} destroyed"
+      echo ""
+
+      if [ "$REPLACES" -gt 0 ]; then
+        echo "WARNING: $REPLACES resource(s) will be REPLACED (destroy + recreate)!"
+        jq -r '.resource_changes[]? | select((.change.actions | index("delete")) and (.change.actions | index("create"))) | "  - \(.address) (\(.type))"' "$PLAN_JSON"
+        echo ""
+      fi
+
+      if [ "$DESTROYS" -gt 0 ]; then
+        echo "WARNING: $DESTROYS resource(s) will be DESTROYED!"
+        jq -r '.resource_changes[]? | select(.change.actions == ["delete"]) | "  - \(.address) (\(.type))"' "$PLAN_JSON"
+        echo ""
+      fi
+
+      DATA_DESTROYS=$(jq -r '.resource_changes[]? | select((.type | test("^aws_(db_instance|elasticache)")) and ((.change.actions | index("delete")) != null)) | "  - \(.address) (\(.type)) actions=\(.change.actions | join(","))"' "$PLAN_JSON")
+      if [ -n "$DATA_DESTROYS" ]; then
+        echo "CRITICAL: Database or cache resources in $TARGET_ENV will be DESTROYED!"
+        echo "This will cause PERMANENT DATA LOSS."
+        echo "$DATA_DESTROYS"
+        echo "If this is intentional, use the corresponding destroy job instead."
+        exit 1
+      fi
+
+      if [ "$DESTROYS" -eq 0 ] && [ "$REPLACES" -eq 0 ]; then
+        echo "No destructive changes detected — safe to apply $TARGET_ENV."
+      elif [ -s "$PLAN_TEXT" ]; then
+        echo "Review the human-readable plan artifact before applying: $PLAN_TEXT"
+      fi
+
+plan-safety-staging:
+  extends: .plan-safety-template
+  resource_group: terraform-staging
+  variables:
+    TARGET_ENV: staging
+  needs:
+    - job: plan-staging
+      artifacts: true
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+plan-safety-production:
+  extends: .plan-safety-template
+  resource_group: terraform-production
+  variables:
+    TARGET_ENV: production
+  needs:
+    - job: plan-production
+      artifacts: true
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# Stage: apply — Creates/updates real AWS resources (per environment)
+# =============================================================================
+# Each environment has its own manual apply gate. A human must click "play"
+# for each environment independently.
+#
+# SAFEGUARDS:
+#   1. Pre-apply validation — checks .tf files for non-ASCII characters that
+#      AWS APIs reject (e.g. em dashes in security group descriptions).
+#   2. Reviewed plan artifact — manual applies use the exact tfplan generated in
+#      the plan stage, so approvals correspond to the applied changes.
+#   3. No automatic destroy rollback — failed applies stop and require human
+#      inspection instead of destroying existing databases, caches, or clusters.
+#   4. Job timeout (30m) — prevents hung apply jobs from running indefinitely.
+
+.apply_base:
+  stage: apply
+  extends: .terraform_env_base
+  timeout: 30m
+  script:
+    # Safeguard 1: catch non-ASCII characters before they hit AWS APIs
+    - |
+      echo "=== Pre-Apply Validation ==="
+      if LC_ALL=C grep -rn '[^[:print:][:space:]]' "$CI_PROJECT_DIR"/modules/ "$CI_PROJECT_DIR"/terraform/ --include='*.tf' 2>/dev/null; then
+        echo ""
+        echo "BLOCKED: Non-ASCII characters found in .tf files (see above)."
+        echo "AWS APIs reject these (e.g. em dashes in security group descriptions)."
+        echo "Fix before applying. No resources were created."
+        exit 1
+      fi
+      echo "Pre-apply validation passed."
+    # Safeguard 2: apply the reviewed plan artifact from the plan stage
+    - |
+      PLAN_FILE="tfplan"
+      if [ ! -s "$PLAN_FILE" ]; then
+        echo "BLOCKED: Missing reviewed Terraform plan artifact: $PLAN_FILE"
+        echo "Re-run the pipeline so plan-$TARGET_ENV produces a fresh tfplan artifact."
+        exit 1
+      fi
+
+      set +e
+      sh /tmp/tf_lock_recovery.sh terraform apply -input=false "$PLAN_FILE"
+      APPLY_EXIT=$?
+      set -e
+      if [ $APPLY_EXIT -ne 0 ]; then
+        echo ""
+        echo "============================================="
+        echo "  APPLY FAILED (exit code $APPLY_EXIT)"
+        echo "  Manual investigation required"
+        echo "============================================="
+        echo ""
+        echo "Automatic terraform destroy rollback is disabled to protect existing data."
+        echo "Inspect the failed apply, then use the explicit destroy-$TARGET_ENV job only if cleanup is intentional."
+        exit $APPLY_EXIT
+      fi
+    - |
+      echo "--- $TARGET_ENV Terraform Outputs ---"
+      terraform output -no-color
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+
+apply-staging:
+  extends: .apply_base
+  resource_group: terraform-staging
+  variables:
+    TARGET_ENV: staging
+  environment:
+    name: staging
+  needs:
+    - job: plan-staging
+      artifacts: true
+    - job: plan-safety-staging
+      artifacts: false
+
+apply-production:
+  extends: .apply_base
+  resource_group: terraform-production
+  variables:
+    TARGET_ENV: production
+  environment:
+    name: production
+  needs:
+    - job: plan-production
+      artifacts: true
+    - job: plan-safety-production
+      artifacts: false
+
+# =============================================================================
+# Stage: ensure — Guarantees a cluster is up (called by CD pipeline)
+# =============================================================================
+# The CD pipeline triggers this pipeline with:
+#   ENSURE_UP=true  and  TARGET_ENV=staging  or  TARGET_ENV=production
+#
+# Flow:
+#   1. CD needs to deploy to staging → triggers with TARGET_ENV=staging
+#   2. CD promotes to prod → triggers with TARGET_ENV=production
+#
+# Scenario 1: Cluster running with nodes  → do nothing
+# Scenario 2: Cluster exists, 0 nodes     → scale up
+# Scenario 3: Cluster doesn't exist       → full terraform apply
+
+ensure-cluster-up:
+  stage: ensure
+  image:
+    name: amazon/aws-cli:2.22.0
+    entrypoint: [""]
+  allow_failure: true
+  script:
+    - |
+      # Resolve cluster/node group name based on TARGET_ENV
+      if [ "$TARGET_ENV" = "production" ]; then
+        CLUSTER=$PROD_CLUSTER_NAME
+        NODE_GROUP=$PROD_NODE_GROUP
+        DESIRED_COUNT=3
+        MAX_COUNT=5
+      else
+        CLUSTER=$STAGING_CLUSTER_NAME
+        NODE_GROUP=$STAGING_NODE_GROUP
+        DESIRED_COUNT=2
+        MAX_COUNT=3
+      fi
+
+      echo "Checking if $TARGET_ENV EKS cluster ($CLUSTER) exists..."
+
+      if ! aws eks describe-cluster --name $CLUSTER --region $AWS_DEFAULT_REGION 2>/dev/null; then
+        echo "Cluster does not exist — full terraform apply needed."
+        exit 1
+      fi
+
+      echo "Cluster exists. Checking node group scaling..."
+      DESIRED=$(aws eks describe-nodegroup \
+        --cluster-name $CLUSTER \
+        --nodegroup-name $NODE_GROUP \
+        --region $AWS_DEFAULT_REGION \
+        --query 'nodegroup.scalingConfig.desiredSize' \
+        --output text 2>/dev/null || echo "0")
+
+      if [ "$DESIRED" = "0" ] || [ "$DESIRED" = "None" ]; then
+        echo "Nodes scaled to 0 — scaling $TARGET_ENV up to $DESIRED_COUNT..."
+        aws eks update-nodegroup-config \
+          --cluster-name $CLUSTER \
+          --nodegroup-name $NODE_GROUP \
+          --region $AWS_DEFAULT_REGION \
+          --scaling-config desiredSize=$DESIRED_COUNT,minSize=0,maxSize=$MAX_COUNT
+
+        echo "Waiting for nodes to become active..."
+        aws eks wait nodegroup-active \
+          --cluster-name $CLUSTER \
+          --nodegroup-name $NODE_GROUP \
+          --region $AWS_DEFAULT_REGION
+        echo "$TARGET_ENV nodes are up."
+      else
+        echo "$TARGET_ENV cluster already running with $DESIRED node(s). Nothing to do."
+      fi
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+
+# Ensure persistent secrets exist before cluster-level apply.
+# This guarantees app-secrets/api-keys/smtp-secrets are available even when
+# the cluster and environment infrastructure are being created from scratch.
+ensure-persistent-secrets:
+  stage: ensure
+  resource_group: terraform-persistent
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  script:
+    - mkdir -p "$TF_PLUGIN_CACHE_DIR"
+    - cd terraform/environments/persistent
+    - terraform init -input=false -reconfigure
+    - terraform plan -input=false -out=tfplan
+    - terraform apply -input=false tfplan
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+
+# Always run after ensure-cluster-up so a missing cluster can be created.
+# If no infra changes are needed, terraform apply is a no-op.
+ensure-apply:
+  stage: ensure
+  extends: .terraform_env_base
+  resource_group: terraform-${TARGET_ENV}
+  timeout: 30m
+  script:
+    - |
+      terraform plan -input=false -out=tfplan
+      set +e
+      sh /tmp/tf_lock_recovery.sh terraform apply -input=false tfplan
+      APPLY_EXIT=$?
+      set -e
+      if [ $APPLY_EXIT -ne 0 ]; then
+        echo ""
+        echo "============================================="
+        echo "  ENSURE-APPLY FAILED (exit code $APPLY_EXIT)"
+        echo "  Manual investigation required"
+        echo "============================================="
+        echo ""
+        echo "Automatic terraform destroy rollback is disabled to protect existing data."
+        echo "Use the explicit destroy-$TARGET_ENV job only if cleanup is intentional."
+        exit $APPLY_EXIT
+      fi
+    - |
+      echo "$TARGET_ENV infrastructure created. Outputs:"
+      terraform output -no-color
+  needs:
+    - job: ensure-cluster-up
+      optional: true
+    - job: ensure-persistent-secrets
+      optional: true
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+
+# =============================================================================
+# Stage: scale — Per-environment manual cost control jobs
+# =============================================================================
+# Each environment can be scaled independently. Scaling to 0 keeps the EKS
+# control plane running (~$0.10/hr) but removes all worker nodes.
+#
+# TYPICAL WORKFLOW (Option C — separate clusters):
+#   1. scale-up-staging    → bring staging cluster up for validation
+#   2. CD deploys + tests  → validate in staging
+#   3. scale-up-production → bring production cluster up
+#   4. CD promotes to prod → canary rollout to production
+#   5. scale-down-staging  → staging no longer needed, tear it down
+#   6. (after demo/use)    → scale-down-production
+
+.scale_up_base:
+  stage: scale
+  image:
+    name: amazon/aws-cli:2.22.0
+    entrypoint: [""]
+  script:
+    - |
+      echo "Scaling ${ENV_LABEL} node group to $DESIRED nodes..."
+      aws eks update-nodegroup-config \
+        --cluster-name ${TARGET_CLUSTER} \
+        --nodegroup-name ${TARGET_NODE_GROUP} \
+        --region $AWS_DEFAULT_REGION \
+        --scaling-config desiredSize=$DESIRED,minSize=0,maxSize=${MAX_SIZE}
+
+      echo "Waiting for ${ENV_LABEL} nodes to become active..."
+      aws eks wait nodegroup-active \
+        --cluster-name ${TARGET_CLUSTER} \
+        --nodegroup-name ${TARGET_NODE_GROUP} \
+        --region $AWS_DEFAULT_REGION
+      echo "${ENV_LABEL} node group scaled to $DESIRED."
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+
+.scale_down_base:
+  stage: scale
+  image:
+    name: amazon/aws-cli:2.22.0
+    entrypoint: [""]
+  script:
+    - |
+      aws eks update-nodegroup-config \
+        --cluster-name ${TARGET_CLUSTER} \
+        --nodegroup-name ${TARGET_NODE_GROUP} \
+        --region $AWS_DEFAULT_REGION \
+        --scaling-config desiredSize=0,minSize=0,maxSize=${MAX_SIZE}
+      echo "${ENV_LABEL} nodes scaled to 0. Control plane still running (~$0.10/hr)."
+      echo "To fully remove ${ENV_LABEL} costs, use 'destroy-${TARGET_ENV}'."
+  rules:
+    - if: $DESTROY_ENV
+      when: never
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+
+scale-down-staging:
+  extends: .scale_down_base
+  resource_group: terraform-staging
+  variables:
+    TARGET_CLUSTER: ${STAGING_CLUSTER_NAME}
+    TARGET_NODE_GROUP: ${STAGING_NODE_GROUP}
+    TARGET_ENV: staging
+    MAX_SIZE: "3"
+    ENV_LABEL: Staging
+
+scale-up-staging:
+  extends: .scale_up_base
+  resource_group: terraform-staging
+  variables:
+    TARGET_CLUSTER: ${STAGING_CLUSTER_NAME}
+    TARGET_NODE_GROUP: ${STAGING_NODE_GROUP}
+    DESIRED: "2"
+    MAX_SIZE: "3"
+    ENV_LABEL: Staging
+
+scale-down-production:
+  extends: .scale_down_base
+  resource_group: terraform-production
+  variables:
+    TARGET_CLUSTER: ${PROD_CLUSTER_NAME}
+    TARGET_NODE_GROUP: ${PROD_NODE_GROUP}
+    TARGET_ENV: production
+    MAX_SIZE: "5"
+    ENV_LABEL: Production
+
+scale-up-production:
+  extends: .scale_up_base
+  resource_group: terraform-production
+  variables:
+    TARGET_CLUSTER: ${PROD_CLUSTER_NAME}
+    TARGET_NODE_GROUP: ${PROD_NODE_GROUP}
+    DESIRED: "3"
+    MAX_SIZE: "5"
+    ENV_LABEL: Production
+
+# =============================================================================
+# Stage: destroy — Per-environment teardown
+# =============================================================================
+# Each environment can be destroyed independently. Destroying staging does NOT
+# affect production, and vice versa. Each has its own Terraform state.
+#
+# WARNING: These are irreversible! All data in RDS and Redis will be lost.
+
+destroy-staging:
+  stage: destroy
+  extends: .terraform_env_base
+  resource_group: terraform-staging
+  variables:
+    TARGET_ENV: staging
+  script:
+    - |
+      set -eu
+
+      # Install AWS CLI/Python helpers if missing (hashicorp/terraform image may not include them).
+      if ! command -v aws >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then
+          apk add --no-cache python3 py3-pip >/dev/null
+          if ! command -v aws >/dev/null 2>&1; then
+            pip3 install --break-system-packages awscli >/dev/null
+          fi
+        fi
+      fi
+
+      empty_s3_bucket_versions() {
+        BUCKET="$1"
+        [ -n "$BUCKET" ] || return 0
+
+        if ! command -v aws >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+          echo "WARNING: aws/python3 not available; cannot pre-empty S3 bucket $BUCKET"
+          return 0
+        fi
+
+        if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+          echo "S3 bucket $BUCKET does not exist or is not accessible; skipping empty step."
+          return 0
+        fi
+
+        echo "Pre-destroy S3 cleanup: emptying $BUCKET so Terraform can delete it."
+        aws s3 rm "s3://$BUCKET" --recursive 2>/dev/null || true
+
+        while :; do
+          aws s3api list-object-versions --bucket "$BUCKET" --output json > /tmp/s3_versions.json || break
+          python3 <<'PY'
+      import json
+
+      with open('/tmp/s3_versions.json', encoding='utf-8') as fh:
+          data = json.load(fh)
+
+      objects = []
+      for section in ('Versions', 'DeleteMarkers'):
+          for item in data.get(section) or []:
+              version_id = item.get('VersionId')
+              entry = {'Key': item['Key']}
+              if version_id:
+                  entry['VersionId'] = version_id
+              objects.append(entry)
+
+      batch = objects[:1000]
+      with open('/tmp/s3_delete.json', 'w', encoding='utf-8') as fh:
+          json.dump({'Objects': batch, 'Quiet': True}, fh)
+      with open('/tmp/s3_delete_count', 'w', encoding='utf-8') as fh:
+          fh.write(str(len(batch)))
+      PY
+          DELETE_COUNT=$(cat /tmp/s3_delete_count)
+          [ "$DELETE_COUNT" -gt 0 ] || break
+          echo "  Deleting $DELETE_COUNT object version(s)/delete marker(s) from $BUCKET..."
+          aws s3api delete-objects --bucket "$BUCKET" --delete file:///tmp/s3_delete.json >/dev/null
+        done
+      }
+
+      # Loki stores logs in S3 and can leave objects behind. Empty it before
+      # destroy so disposable staging observability storage does not block teardown.
+      LOKI_BUCKET=$(terraform output -raw loki_bucket_name 2>/dev/null || true)
+      empty_s3_bucket_versions "$LOKI_BUCKET"
+
+      LOG_FILE="destroy-staging.log"
+      ATTEMPT=1
+      MAX_ATTEMPTS=3
+
+      while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+        echo "Starting staging destroy (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+
+        # Defense-in-depth cleanup: remove orphan ELB resources that can block
+        # subnet/IGW/VPC deletion if Kubernetes service teardown raced Terraform.
+        VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || true)
+        if [ -n "$VPC_ID" ] && command -v aws >/dev/null 2>&1; then
+          echo "Pre-destroy ELB cleanup in VPC: $VPC_ID"
+
+          for ARN in $(aws elbv2 describe-load-balancers --region "$AWS_DEFAULT_REGION" \
+            --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" --output text 2>/dev/null); do
+            [ -n "$ARN" ] || continue
+            echo "  Deleting ELBv2: $ARN"
+            aws elbv2 delete-load-balancer --region "$AWS_DEFAULT_REGION" --load-balancer-arn "$ARN" 2>/dev/null || true
+          done
+
+          for NAME in $(aws elb describe-load-balancers --region "$AWS_DEFAULT_REGION" \
+            --query "LoadBalancerDescriptions[?VPCId=='$VPC_ID'].LoadBalancerName" --output text 2>/dev/null); do
+            [ -n "$NAME" ] || continue
+            echo "  Deleting Classic ELB: $NAME"
+            aws elb delete-load-balancer --region "$AWS_DEFAULT_REGION" --load-balancer-name "$NAME" 2>/dev/null || true
+          done
+
+          for SG in $(aws ec2 describe-security-groups --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "SecurityGroups[?starts_with(GroupName, 'k8s-elb-')].GroupId" --output text 2>/dev/null); do
+            [ -n "$SG" ] || continue
+            echo "  Deleting orphan k8s ELB SG: $SG"
+            aws ec2 delete-security-group --region "$AWS_DEFAULT_REGION" --group-id "$SG" 2>/dev/null || true
+          done
+        fi
+
+        set +e
+        { terraform destroy -input=false -auto-approve 2>&1; echo $? > /tmp/tf_exit_code; } | tee "$LOG_FILE"
+        EXIT_CODE=$(cat /tmp/tf_exit_code)
+        set -e
+
+        if [ "$EXIT_CODE" -eq 0 ]; then
+          echo "Terraform destroy command succeeded. Running post-destroy verification..."
+
+          # Verification 1: Terraform state should be empty for the staging environment.
+          REMAINING_STATE=$(terraform state list 2>/dev/null || true)
+          if [ -n "$REMAINING_STATE" ]; then
+            echo "❌ Destroy reported success, but Terraform state still contains resources:"
+            echo "$REMAINING_STATE"
+            exit 1
+          fi
+
+          # Verification 2: A fresh destroy plan should be a no-op (exit code 0).
+          set +e
+          terraform plan -destroy -input=false -detailed-exitcode > /tmp/staging_destroy_verify.log 2>&1
+          PLAN_EXIT=$?
+          set -e
+
+          if [ "$PLAN_EXIT" -eq 2 ]; then
+            echo "❌ Destroy verification failed: Terraform still sees resources to destroy."
+            cat /tmp/staging_destroy_verify.log
+            exit 1
+          fi
+          if [ "$PLAN_EXIT" -ne 0 ]; then
+            echo "❌ Destroy verification failed: terraform plan returned exit code $PLAN_EXIT"
+            cat /tmp/staging_destroy_verify.log
+            exit 1
+          fi
+
+          echo "✅ All STAGING infrastructure destroyed and verified."
+          exit 0
+        fi
+
+        if grep -q "Error acquiring the state lock" "$LOG_FILE"; then
+          LOCK_ID=$(sed -n 's/^  ID:[[:space:]]*//p' "$LOG_FILE" | head -n 1 | tr -d '\r')
+          if [ -n "$LOCK_ID" ]; then
+            echo "Detected stale Terraform lock: $LOCK_ID"
+            terraform force-unlock -force "$LOCK_ID" || true
+            echo "Retrying destroy after lock recovery..."
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 5
+            continue
+          fi
+        fi
+
+        if grep -Eq "DependencyViolation|in use|security group" "$LOG_FILE"; then
+          echo "Destroy blocked by AWS dependency cleanup (for example, orphan ENIs/ELBs)."
+          echo "Re-running destroy after a short wait in case AWS is still releasing attachments..."
+          ATTEMPT=$((ATTEMPT + 1))
+          sleep 20
+          continue
+        fi
+
+        echo "Destroy failed for a non-retryable reason."
+        exit "$EXIT_CODE"
+      done
+
+      echo "Destroy failed after $MAX_ATTEMPTS attempts."
+      exit 1
+  environment:
+    name: staging
+    action: stop
+  rules:
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $DESTROY_ENV && $DESTROY_ENV != "staging"
+      when: never
+    - if: $DESTROY_ENV == "staging"
+      when: on_success
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+
+destroy-production:
+  stage: destroy
+  extends: .terraform_env_base
+  resource_group: terraform-production
+  variables:
+    TARGET_ENV: production
+  script:
+    - |
+      set -eu
+      LOG_FILE="destroy-production.log"
+      ATTEMPT=1
+      MAX_ATTEMPTS=3
+
+      while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+        echo "Starting production destroy (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+
+        set +e
+        { terraform destroy -input=false -auto-approve 2>&1; echo $? > /tmp/tf_exit_code; } | tee "$LOG_FILE"
+        EXIT_CODE=$(cat /tmp/tf_exit_code)
+        set -e
+
+        if [ "$EXIT_CODE" -eq 0 ]; then
+          echo "All PRODUCTION infrastructure destroyed."
+          exit 0
+        fi
+
+        if grep -q "Error acquiring the state lock" "$LOG_FILE"; then
+          LOCK_ID=$(sed -n 's/^  ID:[[:space:]]*//p' "$LOG_FILE" | head -n 1 | tr -d '\r')
+          if [ -n "$LOCK_ID" ]; then
+            echo "Detected stale Terraform lock: $LOCK_ID"
+            terraform force-unlock -force "$LOCK_ID" || true
+            echo "Retrying destroy after lock recovery..."
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 5
+            continue
+          fi
+        fi
+
+        if grep -Eq "DependencyViolation|in use|security group" "$LOG_FILE"; then
+          echo "Destroy blocked by AWS dependency cleanup (for example, orphan ENIs/ELBs)."
+          echo "Re-running destroy after a short wait in case AWS is still releasing attachments..."
+          ATTEMPT=$((ATTEMPT + 1))
+          sleep 20
+          continue
+        fi
+
+        echo "Destroy failed for a non-retryable reason."
+        exit "$EXIT_CODE"
+      done
+
+      echo "Destroy failed after $MAX_ATTEMPTS attempts."
+      exit 1
+  environment:
+    name: production
+    action: stop
+  rules:
+    - if: $ENSURE_UP == "true"
+      when: never
+    - if: $DESTROY_ENV && $DESTROY_ENV != "production"
+      when: never
+    - if: $DESTROY_ENV == "production"
+      when: on_success
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true

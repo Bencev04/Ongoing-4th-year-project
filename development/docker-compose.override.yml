@@ -1,0 +1,11 @@
+# Local Docker Compose overrides.
+# CI passes explicit -f files and does not load this file, so host ports stay local-only.
+
+services:
+  nginx-gateway:
+    ports:
+      - "${CRM_HTTP_PORT:-8088}:80"
+
+  db:
+    ports:
+      - "${CRM_POSTGRES_PORT:-5433}:5432"

@@ -1,0 +1,65 @@
+# =============================================================================
+# .gitleaks.toml — Gitleaks secret scanning configuration
+# =============================================================================
+#
+# Gitleaks scans the entire git history and staged files for accidentally
+# committed secrets, API keys, passwords, and other credentials.
+#
+# This file defines allowlists for known test/CI secrets that are
+# intentionally committed (e.g., test database passwords, CI fixture keys).
+#
+# Docs: https://github.com/gitleaks/gitleaks
+#
+# Usage:
+#   gitleaks detect --source . --verbose           # Full scan
+#   gitleaks detect --source . --report-format json # JSON report
+
+title = "CRM Calendar — Gitleaks Configuration"
+
+# =============================================================================
+# Global allowlist — patterns that should never trigger a finding
+# =============================================================================
+[allowlist]
+
+# Description of why these are allowlisted
+description = "Known test/CI secrets that are intentionally committed"
+
+# Regex patterns matching known safe values.
+# These appear in docker-compose files, CI config, and test fixtures.
+regexes = [
+    # CI/CD test secret key — used in docker-compose.ci.yml and .gitlab-ci.yml
+    # This is a dummy key for integration test environments only
+    '''ci-test-secret-key-not-for-production''',
+
+    # Test database credentials — used in CI service containers
+    # These only exist inside ephemeral CI containers
+    '''crm_password''',
+    '''crm_user''',
+    '''testpass''',
+    '''testuser''',
+
+    # Demo seed data credentials — used in scripts/seed-demo-data.sql
+    # These are bcrypt hashes of "password123" for demo accounts
+    '''password123''',
+
+    # Placeholder/example tokens in documentation
+    '''YOUR_TOKEN_HERE''',
+    '''your-secret-key''',
+]
+
+# Paths that are expected to contain test/example credentials
+paths = [
+    # Database seed scripts contain demo account passwords (bcrypt hashes)
+    '''scripts/seed-demo-data\.sql''',
+
+    # CI configuration files contain test environment variables
+    '''ci/docker-compose\.ci\.yml''',
+
+    # Documentation may reference example tokens
+    '''docs/.*\.md''',
+    '''README\.md''',
+
+    # Lock files and cache directories
+    '''\.cache/.*''',
+    '''__pycache__/.*''',
+]

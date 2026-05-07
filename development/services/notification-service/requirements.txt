@@ -1,0 +1,21 @@
+fastapi>=0.115.0
+starlette>=0.52.0
+uvicorn[standard]>=0.27.0
+sqlalchemy>=2.0.0
+asyncpg>=0.29.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+httpx>=0.26.0
+redis>=5.0.0
+python-multipart>=0.0.22
+twilio>=9.0.0
+aiosmtplib>=3.0.0
+cryptography>=46.0.0
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+# Structured logging and metrics
+python-json-logger>=2.0.0
+
+# Prometheus metrics
+prometheus-client>=0.19.0

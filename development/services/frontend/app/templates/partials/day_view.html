@@ -1,0 +1,777 @@
+<!-- Day View Modal (HTMX partial)
+     ─────────────────────────────────────────────────────────────
+     Layout:
+       1. Header — day name, date, close button
+       2. Starting Point Bar — toggle between Company / Eircode
+       3. Two-column body:
+          • Left  — filters, event cards, route stats panel
+          • Right — Google Map (full height)
+       4. Footer — "Add Job" action
+     ─────────────────────────────────────────────────────────────
+-->
+
+<!-- JSON data in script tags to avoid breaking HTML attribute quotes -->
+<script id="day-events-data" type="application/json">{{ events_json | safe }}</script>
+<script id="day-employees-data" type="application/json">{{ employees_json | safe }}</script>
+<script id="day-company-data" type="application/json">{{ company_json | safe }}</script>
+
+<!-- Raw map reference outside Alpine proxy (Google Maps API breaks with Proxy objects) -->
+<script>var _dayViewRawMap = null;</script>
+
+<div class="fixed inset-0 z-50 overflow-y-auto"
+     x-data="{
+        /* ── Core state ── */
+        open: true,               /* Controls modal visibility */
+        events: [],               /* All events for this day (server-injected JSON) */
+        employees: [],            /* All employees available for filtering */
+        company: null,            /* Company object with address for route start */
+        filterEmployee: '',       /* Active employee filter (empty = all) */
+        filterStatus: '',         /* Active status filter (empty = all) */
+
+        /* ── Map state ── */
+        map: null,                /* Google Maps instance (proxied by Alpine) */
+        _rawMarkers: [],          /* Currently rendered map markers */
+        _routePolylines: [],      /* Currently rendered route polylines */
+        mapReady: false,          /* True once the Google Map is initialised */
+
+        /* ── Starting-point selector ── */
+        startMode: 'company',          /* 'company' | 'custom' */
+        customStartInput: '',          /* Bound to the eircode/address text field */
+        _startLatLng: null,            /* Resolved {lat, lng} for custom address */
+        _startAutocomplete: null,      /* Google Places Autocomplete instance */
+        resolvingAddress: false,       /* Spinner while geocoding custom address */
+
+        /* ── Route stats (shown in left-side panel) ── */
+        routeSummary: null,            /* {distance, duration, stopCount, durationInTraffic} */
+        calculatingRoute: false,       /* Spinner while route is being calculated */
+
+        /* ── Route colours — one per employee, cycled for consistency ── */
+        _empRouteColours: ['#0d9488','#6366f1','#ec4899','#f59e0b','#10b981','#ef4444','#8b5cf6','#3b82f6'],
+
+        /* ───────────────────────────────
+         *  Computed helpers
+         * ─────────────────────────────── */
+
+        /**
+         * Return events matching the active employee and status filters.
+         *
+         * Both filters are optional \u2014 when empty (default), all events pass.
+         * Used to populate the event list and as the input for geoJobs().
+         *\n         * @returns {Array} Filtered event objects\n         */
+        filteredEvents() {
+            return this.events.filter((event) => {
+                const matchesEmployee = !this.filterEmployee ||
+                    String(event.assigned_to || '') === this.filterEmployee;
+                const matchesStatus = !this.filterStatus ||
+                    String(event.status || '') === this.filterStatus;
+                return matchesEmployee && matchesStatus;
+            });
+        },
+
+        /**
+         * Return only filtered events that have valid lat/lng coordinates.\n         *\n         * These are the jobs that can be plotted on the map as markers\n         * and potentially included in route calculations.\n         *\n         * @returns {Array} Geo-tagged event objects\n         */
+        geoJobs() {
+            return this.filteredEvents().filter(
+                (e) => e.latitude && e.longitude && !isNaN(parseFloat(e.latitude)) && !isNaN(parseFloat(e.longitude))
+            );
+        },
+
+        /* ───────────────────────────────
+         *  Starting-point logic
+         * ─────────────────────────────── */
+
+        /** Switch the starting-point mode and recalculate routes. */
+        setStartMode(mode) {
+            this.startMode = mode;
+            /* Reset custom coords when switching back to company */
+            if (mode === 'company') {
+                this._startLatLng = null;
+                this.customStartInput = '';
+                this.updateMap();
+            }
+            /* When switching to custom, wait for user input */
+        },
+
+        /** Resolve the current starting point to a {lat,lng} object.
+         *  Returns null if the address cannot be resolved. */
+        async _resolveStartPoint() {
+            /* Company mode: geocode the stored company address */
+            if (this.startMode === 'company') {
+                if (this.company && this.company.address) {
+                    try {
+                        return await geocodeAddress(this.company.address);
+                    } catch (_) { return null; }
+                }
+                return null;
+            }
+            /* Custom mode: use the already-resolved coordinates */
+            return this._startLatLng;
+        },
+
+        /** Init the Google Places Autocomplete for the custom address input.
+         *  Also listens for Enter key to geocode plain Eircodes. */
+        _initStartAutocomplete() {
+            const inputEl = this.$refs.startAddressInput;
+            if (!inputEl || !window.mapsReady) return;
+
+            /* Google Places Autocomplete (restricted to Ireland) */
+            const ac = new google.maps.places.Autocomplete(inputEl, {
+                componentRestrictions: { country: 'ie' },
+                fields: ['geometry', 'formatted_address'],
+            });
+            ac.addListener('place_changed', () => {
+                const place = ac.getPlace();
+                if (place.geometry && place.geometry.location) {
+                    this._startLatLng = {
+                        lat: place.geometry.location.lat(),
+                        lng: place.geometry.location.lng(),
+                    };
+                    this.updateMap();
+                }
+            });
+            this._startAutocomplete = ac;
+
+            /* Fallback: if user types an Eircode and presses Enter,
+             * geocode it via the standard geocoder. */
+            inputEl.addEventListener('keydown', async (e) => {
+                if (e.key !== 'Enter') return;
+                e.preventDefault();
+                const query = inputEl.value.trim();
+                if (!query) return;
+                this.resolvingAddress = true;
+                try {
+                    const coords = await geocodeAddress(query + ', Ireland');
+                    if (coords) {
+                        this._startLatLng = { lat: coords.lat, lng: coords.lng };
+                        this.updateMap();
+                    }
+                } finally {
+                    this.resolvingAddress = false;
+                }
+            });
+        },
+
+        /* ───────────────────────────────
+         *  Map lifecycle
+         * ─────────────────────────────── */
+
+        /**
+         * Create the Google Map instance when the DOM is ready.
+         *
+         * Stores the raw map reference in `_dayViewRawMap` (module scope)
+         * to avoid Alpine.js proxy wrapping, which breaks Google Maps
+         * internal API calls. Then triggers the initial `updateMap()`.
+         */
+        initMap() {
+            const el = this.$refs.dayMap;
+            if (!el || this.map) return;
+
+            const opts = {
+                center: { lat: 53.35, lng: -6.26 },
+                zoom: 7,
+                disableDefaultUI: true,
+                zoomControl: true,
+                mapTypeControl: false,
+                streetViewControl: false,
+            };
+            {% if google_maps_map_id %}
+            opts.mapId = '{{ google_maps_map_id }}';
+            {% endif %}
+
+            _dayViewRawMap = new google.maps.Map(el, opts);
+            this.map = _dayViewRawMap;
+            this.mapReady = true;
+            this.updateMap();
+        },
+
+        /**
+         * Re-render markers and routes after a filter or start-point change.
+         *
+         * Called whenever the employee filter, status filter, or starting-
+         * point selector changes. Clears all existing markers and route
+         * polylines from the map, then redraws based on the current state.
+         *
+         * Routing logic:
+         *  - Single employee filtered → _renderEmployeeRoute()
+         *  - No filter (all employees) → _renderAllRoutes()
+         */
+        updateMap() {
+            if (!this.mapReady) return;
+
+            /* Clear previous markers and routes before redrawing */
+            this._clearMarkers();
+            this._clearRoutes();
+            this.routeSummary = null;
+
+            if (this.filterEmployee) {
+                this._renderEmployeeRoute();
+            } else {
+                this._renderAllRoutes();
+            }
+        },
+
+        /** Remove all job markers from the map and reset the array. */
+        _clearMarkers() {
+            this._rawMarkers.forEach((m) => {
+                /* AdvancedMarkerElement uses .map property */
+                try { m.map = null; } catch(_){}
+                /* Legacy Marker uses .setMap() method */
+                if (typeof m.setMap === 'function') { try { m.setMap(null); } catch(_){} }
+            });
+            this._rawMarkers = [];
+        },
+
+        /** Remove all route polylines from the map and reset the array. */
+        _clearRoutes() {
+            this._routePolylines.forEach((p) => clearRoutePolyline(p));
+            this._routePolylines = [];
+        },
+
+        /* ───────────────────────────────
+         *  Route rendering
+         * ─────────────────────────────── */
+
+        /**
+         * Render all employees' daily routes on the map.
+         *
+         * Groups geo-tagged jobs by assigned employee and draws one
+         * colour-coded route per employee who has 2+ jobs. Employees
+         * with only a single job get a marker but NO route line, since
+         * a route with one stop is meaningless. Unassigned jobs are
+         * shown as markers only (never routed).
+         *
+         * Route stats (distance, time, traffic) are accumulated across
+         * all routed employees and displayed in the summary panel.
+         */
+        async _renderAllRoutes() {
+            const map = _dayViewRawMap;
+            const jobs = this.geoJobs();
+            const points = [];
+
+            /* Step 1 — Place a marker for every geo-tagged job */
+            jobs.forEach((job) => {
+                const created = createJobMarker(job, map);
+                if (!created) return;
+                this._rawMarkers.push(created.marker);
+                points.push({ lat: parseFloat(job.latitude), lng: parseFloat(job.longitude) });
+            });
+
+            /* Fit the viewport to show all markers */
+            fitMapBounds(map, points);
+
+            /* Step 2 — Group jobs by their assigned employee ID.
+             * Unassigned jobs are collected but never routed. */
+            const byEmployee = {};
+            jobs.forEach((job) => {
+                const empId = job.assigned_to || 'unassigned';
+                if (!byEmployee[empId]) byEmployee[empId] = [];
+                byEmployee[empId].push(job);
+            });
+
+            /* Only consider assigned employees for routing */
+            const empIds = Object.keys(byEmployee).filter((k) => k !== 'unassigned');
+            if (empIds.length === 0) return;
+
+            /* Step 3 — Resolve the starting point (company or custom address).
+             * Used as both origin and destination for round-trip routes. */
+            const start = await this._resolveStartPoint();
+            if (!start) return;
+
+            this.calculatingRoute = true;
+            try {
+                /* Accumulate route stats across all routed employees */
+                let totalDist = 0;
+                let totalSec = 0;
+                let totalTrafficSec = 0;
+                let hasTraffic = false;
+                let totalStops = 0;
+
+                for (let i = 0; i < empIds.length; i++) {
+                    const empJobs = byEmployee[empIds[i]];
+                    if (empJobs.length === 0) continue;
+
+                    /* ── Single-job employee: marker only, no route ──
+                     * A single stop doesn't form a meaningful route,
+                     * so we just count it and skip route calculation. */
+                    if (empJobs.length === 1) {
+                        totalStops += 1;
+                        continue;
+                    }
+
+                    /* ── Multi-job employee: calculate a round-trip route ── */
+
+                    /* Sort by scheduled start time for logical route order */
+                    const sorted = [...empJobs].sort((a, b) =>
+                        (a.start_time || '').localeCompare(b.start_time || ''));
+
+                    /* Build stops: start → jobs (sorted) → back to start */
+                    const stops = [
+                        { lat: start.lat, lng: start.lng },
+                        ...sorted.map((j) => ({ lat: parseFloat(j.latitude), lng: parseFloat(j.longitude) })),
+                        { lat: start.lat, lng: start.lng },
+                    ];
+
+                    /* Pick a colour from the rotating palette */
+                    const colour = this._empRouteColours[i % this._empRouteColours.length];
+                    try {
+                        const result = await calculateRoute(stops, {
+                            optimize: true,
+                            map: map,
+                            strokeColor: colour,
+                            traffic: true,
+                        });
+                        if (result.polyline) this._routePolylines.push(result.polyline);
+
+                        /* Accumulate totals from this employee's route */
+                        if (result.summary) {
+                            totalDist += result.summary.distanceMetres;
+                            totalSec += result.summary.durationSeconds;
+                            totalStops += sorted.length;
+                            if (result.summary.durationInTrafficSeconds) {
+                                totalTrafficSec += result.summary.durationInTrafficSeconds;
+                                hasTraffic = true;
+                            }
+                        }
+                    } catch (_) { /* skip this employee's route on error */ }
+                }
+
+                /* Step 4 — Build a combined summary for the stats panel */
+                if (totalStops > 0) {
+                    const km = (totalDist / 1000).toFixed(1);
+                    const hrs = Math.floor(totalSec / 3600);
+                    const mins = Math.round((totalSec % 3600) / 60);
+                    let trafficStr = null;
+                    if (hasTraffic) {
+                        const tHrs = Math.floor(totalTrafficSec / 3600);
+                        const tMins = Math.round((totalTrafficSec % 3600) / 60);
+                        trafficStr = tHrs > 0 ? tHrs + 'h ' + tMins + 'm' : tMins + ' min';
+                    }
+                    this.routeSummary = {
+                        distance: km + ' km',
+                        duration: hrs > 0 ? hrs + 'h ' + mins + 'm' : mins + ' min',
+                        stopCount: totalStops,
+                        durationInTraffic: trafficStr,
+                    };
+                }
+            } finally {
+                this.calculatingRoute = false;
+            }
+        },
+
+        /**
+         * Render the route for a single filtered employee.
+         *
+         * When an employee is selected in the filter dropdown, this
+         * method shows only their jobs. If the employee has 2+ jobs,
+         * a round-trip route is drawn (start → jobs → start). If the
+         * employee has only 1 job, only the marker is shown with no
+         * route line, since a single stop isn't a meaningful route.
+         */
+        async _renderEmployeeRoute() {
+            const map = _dayViewRawMap;
+            const jobs = this.geoJobs();
+
+            /* No geo-tagged jobs — reset the map view */
+            if (jobs.length === 0) { fitMapBounds(map, []); return; }
+
+            /* Place markers for all matching jobs */
+            const points = [];
+            jobs.forEach((job) => {
+                const created = createJobMarker(job, map);
+                if (created) {
+                    this._rawMarkers.push(created.marker);
+                    points.push({ lat: parseFloat(job.latitude), lng: parseFloat(job.longitude) });
+                }
+            });
+
+            /* ── Single job: show marker only, skip route calculation ──
+             * A single stop doesn't form a meaningful route, so just
+             * fit the map to show that one marker. */
+            if (jobs.length === 1) {
+                fitMapBounds(map, points);
+                this.routeSummary = { stopCount: 1, distance: '—', duration: '—', durationInTraffic: null };
+                return;
+            }
+
+            /* ── Multiple jobs: calculate a round-trip route ── */
+
+            /* Sort jobs by start_time for logical route order */
+            const sorted = [...jobs].sort((a, b) =>
+                (a.start_time || '').localeCompare(b.start_time || ''));
+
+            /* Resolve start point (company address or custom eircode) */
+            const start = await this._resolveStartPoint();
+            if (!start) { fitMapBounds(map, points); return; }
+
+            /* Build stops: start → jobs (sorted) → back to start */
+            const stops = [
+                { lat: start.lat, lng: start.lng },
+                ...sorted.map((j) => ({ lat: parseFloat(j.latitude), lng: parseFloat(j.longitude) })),
+                { lat: start.lat, lng: start.lng },
+            ];
+
+            this.calculatingRoute = true;
+            try {
+                const result = await calculateRoute(stops, {
+                    optimize: true,
+                    map: map,
+                    traffic: true,
+                });
+                if (result.polyline) this._routePolylines.push(result.polyline);
+                /* Override stopCount — summariseRoute counts route legs,
+                 * but we want the number of job stops (excluding start/end). */
+                this.routeSummary = { ...result.summary, stopCount: sorted.length };
+            } catch (err) {
+                console.error('Day view route calculation failed:', err.message);
+                fitMapBounds(map, points);
+            } finally {
+                this.calculatingRoute = false;
+            }
+        },
+
+        /* ───────────────────────────────
+         *  Helpers
+         * ─────────────────────────────── */
+
+        /** Open a job modal and return to day view when it closes. */
+        openJobModal(url) {
+            const container = document.getElementById('modal-container');
+            const dateStr = '{{ date_str }}';
+            const observer = new MutationObserver(() => {
+                if (container.innerHTML.trim() === '') {
+                    observer.disconnect();
+                    htmx.ajax('GET', '/calendar/day/' + dateStr, {target: '#modal-container', swap: 'innerHTML'});
+                }
+            });
+            observer.observe(container, { childList: true });
+            htmx.ajax('GET', url, {target: '#modal-container', swap: 'innerHTML'});
+        }
+     }"
+     x-init="
+        /* Parse server-injected JSON data */
+        events = JSON.parse(document.getElementById('day-events-data').textContent);
+        employees = JSON.parse(document.getElementById('day-employees-data').textContent);
+        company = JSON.parse(document.getElementById('day-company-data').textContent);
+
+        /* Initialise the map once Google Maps API is ready */
+        $nextTick(() => {
+            if (window.mapsReady) { initMap(); }
+            else { document.addEventListener('maps-ready', () => initMap(), { once: true }); }
+        });
+     "
+     x-show="open"
+     x-transition>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Backdrop — click to close
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="fixed inset-0 bg-black bg-opacity-50"
+         @click="open = false; setTimeout(() => document.getElementById('modal-container').innerHTML = '', 200)">
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Modal Panel
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="flex min-h-full items-center justify-center p-4">
+        <!-- Modal panel — uses max-w-7xl and max-h-[90vh] for a larger
+             map area that fills most of the viewport -->
+        <div class="relative bg-white rounded-xl shadow-2xl max-w-7xl w-full max-h-[90vh] overflow-hidden flex flex-col"
+             @click.stop
+             x-transition>
+
+            <!-- ─── Header ───────────────────────────────────── -->
+            <div class="px-6 py-4 border-b bg-gray-50 rounded-t-xl flex items-center justify-between">
+                <div>
+                    <h3 class="text-lg font-semibold text-gray-900">
+                        {{ date.strftime('%A') }}
+                    </h3>
+                    <p class="text-sm text-gray-500">
+                        {{ date.strftime('%B %d, %Y') }}
+                    </p>
+                </div>
+                <button @click="open = false; setTimeout(() => document.getElementById('modal-container').innerHTML = '', 200)"
+                        class="text-gray-400 hover:text-gray-600 transition-colors">
+                    <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+
+            <!-- ─── Starting Point Bar ───────────────────────── -->
+            <!-- Two toggle buttons let the user choose the route origin:
+                 • Company Location — uses the company address on file
+                 • Enter Eircode / Address — free-text with autocomplete -->
+            <div class="px-6 py-3 border-b bg-white">
+                <label class="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Starting Point</label>
+                <div class="flex flex-col sm:flex-row items-start sm:items-center gap-3">
+                    <!-- Toggle button group -->
+                    <div class="inline-flex rounded-lg border border-gray-200 p-0.5 bg-gray-100">
+                        <!-- Company Location button -->
+                        <button @click="setStartMode('company')"
+                                :class="startMode === 'company'
+                                    ? 'bg-teal-600 text-white shadow-sm'
+                                    : 'text-gray-600 hover:text-gray-800 hover:bg-gray-50'"
+                                class="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-md transition-all duration-150">
+                            <!-- Building/office icon -->
+                            <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
+                            </svg>
+                            Company Location
+                        </button>
+                        <!-- Custom address button -->
+                        <button @click="setStartMode('custom')"
+                                :class="startMode === 'custom'
+                                    ? 'bg-teal-600 text-white shadow-sm'
+                                    : 'text-gray-600 hover:text-gray-800 hover:bg-gray-50'"
+                                class="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-md transition-all duration-150">
+                            <!-- Map pin icon -->
+                            <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                            </svg>
+                            Enter Eircode / Address
+                        </button>
+                    </div>
+
+                    <!-- Custom address input — shown only in custom mode -->
+                    <template x-if="startMode === 'custom'">
+                        <div class="relative flex-1 w-full sm:max-w-sm">
+                            <input type="text"
+                                   x-ref="startAddressInput"
+                                   x-model="customStartInput"
+                                   x-init="$nextTick(() => _initStartAutocomplete())"
+                                   placeholder="e.g. D08 XY12 or 123 Main St, Dublin"
+                                   class="block w-full border border-gray-300 rounded-lg text-sm py-2 pl-3 pr-10 placeholder-gray-400
+                                          focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-teal-500 transition-shadow" />
+                            <!-- Resolving spinner (shown while geocoding) -->
+                            <div x-show="resolvingAddress" class="absolute inset-y-0 right-0 flex items-center pr-3">
+                                <svg class="animate-spin h-4 w-4 text-teal-500" viewBox="0 0 24 24">
+                                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/>
+                                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                                </svg>
+                            </div>
+                        </div>
+                    </template>
+
+                    <!-- Company address preview (read-only hint) -->
+                    <template x-if="startMode === 'company' && company && company.address">
+                        <p class="text-xs text-gray-400 truncate max-w-xs" x-text="company.address"></p>
+                    </template>
+                </div>
+            </div>
+
+            <!-- ─── Filter Controls ──────────────────────────── -->
+            <div class="px-6 pt-3 pb-2 border-b bg-white">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Employee</label>
+                        <select x-model="filterEmployee"
+                                @change="$nextTick(() => updateMap())"
+                                class="block w-full border border-gray-300 rounded-md text-sm py-2 pl-3 pr-8 focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                            <option value="">All employees</option>
+                            <template x-for="emp in employees" :key="emp.id">
+                                <option :value="String(emp.id)" x-text="`${emp.first_name || ''} ${emp.last_name || ''}`.trim()"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-gray-600 mb-1">Status</label>
+                        <select x-model="filterStatus"
+                                @change="$nextTick(() => updateMap())"
+                                class="block w-full border border-gray-300 rounded-md text-sm py-2 pl-3 pr-8 focus:outline-none focus:ring-1 focus:ring-teal-500 focus:border-teal-500">
+                            <option value="">All statuses</option>
+                            <option value="pending">Pending</option>
+                            <option value="scheduled">Scheduled</option>
+                            <option value="in_progress">In Progress</option>
+                            <option value="completed">Completed</option>
+                            <option value="cancelled">Cancelled</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══════════════════════════════════════════════════
+                 Two-Column Body: Left = Events + Stats, Right = Map
+                 flex-1 + overflow-hidden lets the body fill all
+                 remaining modal height so the map stretches vertically.
+                 ═══════════════════════════════════════════════════ -->
+            <div class="flex flex-col lg:flex-row flex-1 overflow-hidden">
+
+                <!-- ─── Left Panel: Events List + Route Stats ─── -->
+                <div class="lg:w-2/5 border-r border-gray-200 flex flex-col">
+
+                    <!-- Scrollable events list -->
+                    <div class="px-6 py-4 flex-1 max-h-[24rem] overflow-y-auto">
+                        {% if events %}
+                        <div class="space-y-3">
+                            <template x-for="event in filteredEvents()" :key="event.id">
+                                <div class="p-3 border rounded-lg hover:shadow-md transition-shadow cursor-pointer"
+                                     :class="event.priority ? `priority-${event.priority}` : ''"
+                                     @click.stop="openJobModal(`/calendar/job-modal?job_id=${event.id}`)">
+                                    <div class="flex items-start justify-between">
+                                        <div>
+                                            <h4 class="font-medium text-gray-900" x-text="event.title"></h4>
+                                            <p class="text-sm text-gray-500" x-show="event.start_time">
+                                                <span x-text="event.start_time"></span>
+                                                <span x-show="event.end_time"> - <span x-text="event.end_time"></span></span>
+                                            </p>
+                                        </div>
+                                        <span class="text-xs px-2 py-1 rounded-full"
+                                              :class="{
+                                                  'bg-yellow-100 text-yellow-800': event.status === 'pending',
+                                                  'bg-blue-100 text-blue-800': event.status === 'scheduled',
+                                                  'bg-green-100 text-green-800': event.status === 'in_progress',
+                                                  'bg-gray-100 text-gray-800': event.status === 'completed' || event.status === 'cancelled' || !event.status,
+                                              }"
+                                              x-text="String(event.status || '').replace('_', ' ').replace(/\b\w/g, c => c.toUpperCase())">
+                                        </span>
+                                    </div>
+                                </div>
+                            </template>
+                            <div x-show="filteredEvents().length === 0" class="text-center py-6 text-sm text-gray-500">
+                                No jobs match the selected filters.
+                            </div>
+                        </div>
+                        {% else %}
+                        <div class="text-center py-8">
+                            <svg class="mx-auto h-12 w-12 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                            </svg>
+                            <p class="mt-2 text-sm text-gray-500">No jobs scheduled for this day</p>
+                        </div>
+                        {% endif %}
+                    </div>
+
+                    <!-- ─── Route Stats Panel ──────────────────── -->
+                    <!-- Always-visible panel below the event list.
+                         Shows route statistics (stops, distance, time,
+                         traffic-adjusted time) once calculated. -->
+                    <div class="border-t bg-gray-50 px-6 py-4">
+                        <h4 class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Route Summary</h4>
+
+                        <!-- Calculating spinner -->
+                        <div x-show="calculatingRoute" x-cloak class="flex items-center gap-2 text-sm text-gray-500 py-2">
+                            <svg class="animate-spin h-4 w-4 text-teal-500" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                            </svg>
+                            Calculating route&hellip;
+                        </div>
+
+                        <!-- Stats grid — shown when route summary is available -->
+                        <div x-show="routeSummary && !calculatingRoute" x-cloak class="grid grid-cols-2 gap-3">
+                            <!-- Stops -->
+                            <div class="bg-white rounded-lg p-3 border border-gray-200 shadow-sm">
+                                <div class="flex items-center gap-2 mb-1">
+                                    <div class="flex-shrink-0 w-7 h-7 rounded-full bg-teal-100 flex items-center justify-center">
+                                        <svg class="h-3.5 w-3.5 text-teal-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                  d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                  d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                                        </svg>
+                                    </div>
+                                    <span class="text-xs text-gray-500 font-medium">Stops</span>
+                                </div>
+                                <p class="text-lg font-bold text-gray-900 ml-9" x-text="routeSummary.stopCount"></p>
+                            </div>
+
+                            <!-- Total distance -->
+                            <div class="bg-white rounded-lg p-3 border border-gray-200 shadow-sm">
+                                <div class="flex items-center gap-2 mb-1">
+                                    <div class="flex-shrink-0 w-7 h-7 rounded-full bg-blue-100 flex items-center justify-center">
+                                        <svg class="h-3.5 w-3.5 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                  d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l5.447 2.724A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                                        </svg>
+                                    </div>
+                                    <span class="text-xs text-gray-500 font-medium">Distance</span>
+                                </div>
+                                <p class="text-lg font-bold text-gray-900 ml-9" x-text="routeSummary.distance"></p>
+                            </div>
+
+                            <!-- Travel time (no traffic) -->
+                            <div class="bg-white rounded-lg p-3 border border-gray-200 shadow-sm">
+                                <div class="flex items-center gap-2 mb-1">
+                                    <div class="flex-shrink-0 w-7 h-7 rounded-full bg-amber-100 flex items-center justify-center">
+                                        <svg class="h-3.5 w-3.5 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                  d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        </svg>
+                                    </div>
+                                    <span class="text-xs text-gray-500 font-medium">Est. Time</span>
+                                </div>
+                                <p class="text-lg font-bold text-gray-900 ml-9" x-text="routeSummary.duration"></p>
+                            </div>
+
+                            <!-- Traffic-adjusted time -->
+                            <div class="bg-white rounded-lg p-3 border border-gray-200 shadow-sm"
+                                 :class="routeSummary.durationInTraffic ? '' : 'opacity-50'">
+                                <div class="flex items-center gap-2 mb-1">
+                                    <div class="flex-shrink-0 w-7 h-7 rounded-full bg-red-100 flex items-center justify-center">
+                                        <!-- Car/traffic icon -->
+                                        <svg class="h-3.5 w-3.5 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                  d="M13 10V3L4 14h7v7l9-11h-7z" />
+                                        </svg>
+                                    </div>
+                                    <span class="text-xs text-gray-500 font-medium">With Traffic</span>
+                                </div>
+                                <p class="text-lg font-bold ml-9"
+                                   :class="routeSummary.durationInTraffic ? 'text-red-600' : 'text-gray-400'"
+                                   x-text="routeSummary.durationInTraffic || '—'"></p>
+                            </div>
+                        </div>
+
+                        <!-- Empty state — shown when no route data exists yet -->
+                        <div x-show="!routeSummary && !calculatingRoute" class="text-center py-3">
+                            <p class="text-xs text-gray-400">
+                                <template x-if="geoJobs().length === 0">
+                                    <span>No geo-tagged jobs to route</span>
+                                </template>
+                                <template x-if="geoJobs().length > 0 && startMode === 'custom' && !_startLatLng">
+                                    <span>Enter an address above to calculate routes</span>
+                                </template>
+                                <template x-if="geoJobs().length > 0 && startMode === 'company' && !(company && company.address)">
+                                    <span>No company address on file</span>
+                                </template>
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ─── Right Panel: Google Map ──────────────── -->
+                <!-- Map fills the right column; uses min-h-[28rem] on
+                     mobile and flex-1 on desktop to fill the available
+                     modal height, providing a larger map canvas. -->
+                <div class="lg:w-3/5 flex flex-col">
+                    <div x-ref="dayMap" class="w-full min-h-[28rem] flex-1 bg-gray-100 rounded-br-xl"></div>
+
+                    <!-- Job count indicator (always visible below map) -->
+                    <div x-show="geoJobs().length > 0" x-cloak
+                         class="px-4 py-2 bg-gray-50 border-t text-xs text-gray-500 rounded-br-xl">
+                        Showing <span class="font-semibold" x-text="geoJobs().length"></span>
+                        job location<span x-show="geoJobs().length !== 1">s</span> on the map
+                    </div>
+                </div>
+            </div>
+
+            <!-- ─── Footer ───────────────────────────────────── -->
+            <div class="px-6 py-4 border-t bg-gray-50 rounded-b-xl flex justify-end">
+                <button x-show="$store.permissions.canCreateJob"
+                    x-cloak
+                    @click.stop="openJobModal('/calendar/job-modal?date={{ date_str }}')"
+                        class="inline-flex items-center px-4 py-2 text-sm font-medium text-white bg-orange-500 rounded-md hover:bg-orange-600 transition-colors">
+                    <svg class="h-4 w-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                    </svg>
+                    Add Job
+                </button>
+            </div>
+        </div>
+    </div>
+</div>

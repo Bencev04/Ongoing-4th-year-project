@@ -1,0 +1,293 @@
+# CI/CD Docker Compose Override
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f ci/docker-compose.ci.yml up -d
+#
+# Purpose:
+#   Overrides the main docker-compose.yml for CI environments:
+#   - Removes host port mappings (not needed in CI)
+#   - Scopes container names to each GitLab job to avoid shared runner collisions
+#   - Sets restart: "no" (fail fast rather than retry)
+#   - Pins deterministic environment variables (no .env file in CI)
+#   - Adds an integration-runner container that runs tests inside the network
+#   - Enables BuildKit cache_from for faster rebuilds using registry images
+
+x-ci-observability-env: &ci-observability-env
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  ENVIRONMENT: ci
+  SERVICE_VERSION: ${CI_COMMIT_SHORT_SHA:-ci-local}
+
+services:
+  # ---------------------------------------------------------------------------
+  # Override: NGINX — remove host port, use expose only, enable cache
+  # ---------------------------------------------------------------------------
+  nginx-gateway:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-nginx-gateway
+    # The CI config is baked into the image at build time via the NGINX_CONF
+    # build arg below.  Do NOT use a volume bind mount here — it breaks in
+    # Docker-socket CI runners where /builds/... doesn't exist on the host.
+    build:
+      context: ./services
+      dockerfile: nginx/Dockerfile
+      args:
+        NGINX_CONF: nginx/nginx-ci.conf
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:nginx-latest
+    healthcheck:
+      interval: 2s
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Override: PostgreSQL — remove host port exposure
+  # ---------------------------------------------------------------------------
+  db:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-db
+    environment:
+      POSTGRES_USER: crm_user
+      POSTGRES_PASSWORD: crm_password
+      POSTGRES_DB: crm_calendar
+    healthcheck:
+      interval: 2s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Override: Redis — no changes needed (already internal-only)
+  # ---------------------------------------------------------------------------
+  redis:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-redis
+    healthcheck:
+      interval: 2s
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Override: Migration runner — fail fast, deterministic env
+  migration-runner:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-migration-runner
+    environment:
+      <<: *ci-observability-env
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+
+  # ---------------------------------------------------------------------------
+  # Override: All application services — fail fast, deterministic env
+  # ---------------------------------------------------------------------------
+  user-db-access-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-user-db-access-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:user-db-access-service-latest
+    environment:
+      <<: *ci-observability-env
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  customer-db-access-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-customer-db-access-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:customer-db-access-service-latest
+    environment:
+      <<: *ci-observability-env
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  job-db-access-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-job-db-access-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:job-db-access-service-latest
+    environment:
+      <<: *ci-observability-env
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  auth-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-auth-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:auth-service-latest
+    environment:
+      <<: *ci-observability-env
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/0
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  user-bl-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-user-bl-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:user-bl-service-latest
+    environment:
+      <<: *ci-observability-env
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/1
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  job-bl-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-job-bl-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:job-bl-service-latest
+    environment:
+      <<: *ci-observability-env
+      JOB_SERVICE_URL: http://job-db-access-service:8003
+      CUSTOMER_SERVICE_URL: http://customer-db-access-service:8002
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/2
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  customer-bl-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-customer-bl-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:customer-bl-service-latest
+    environment:
+      <<: *ci-observability-env
+      CUSTOMER_SERVICE_URL: http://customer-db-access-service:8002
+      JOB_SERVICE_URL: http://job-db-access-service:8003
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/3
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  admin-bl-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-admin-bl-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:admin-bl-service-latest
+    environment:
+      <<: *ci-observability-env
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      AUTH_SERVICE_URL: http://auth-service:8005
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/4
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  maps-access-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-maps-access-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:maps-access-service-latest
+    environment:
+      <<: *ci-observability-env
+      GOOGLE_MAPS_SERVER_KEY: ""
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/5
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  notification-service:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-notification-service
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:notification-service-latest
+    environment:
+      <<: *ci-observability-env
+      DATABASE_URL: postgresql+asyncpg://crm_user:crm_password@db:5432/crm_calendar
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password}@redis:6379/6
+      AUTH_SERVICE_URL: http://auth-service:8005
+      USER_SERVICE_URL: http://user-db-access-service:8001
+      JOB_BL_SERVICE_URL: http://job-bl-service:8006
+      CUSTOMER_BL_SERVICE_URL: http://customer-bl-service:8007
+      ADMIN_BL_SERVICE_URL: http://admin-bl-service:8008
+      NOTIFICATION_ENCRYPTION_KEY: N-eVJSkGN-xhTPlC0BbhogplusjhWprFlh0z6286lns=
+      SMTP_HOST: localhost
+      SMTP_PORT: "1025"
+      SMTP_FROM_EMAIL: noreply@ci.local
+      SMTP_FROM_NAME: CI Notifications
+      SMTP_USE_TLS: "false"
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  frontend:
+    restart: "no"
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-frontend
+    build:
+      cache_from:
+        - ${IMAGE_TAG:-bencev04/4th-year-proj-tadgh-bence}:frontend-latest
+    environment:
+      <<: *ci-observability-env
+      USER_SERVICE_URL: http://user-bl-service:8004
+      CUSTOMER_SERVICE_URL: http://customer-bl-service:8007
+      JOB_SERVICE_URL: http://job-bl-service:8006
+      AUTH_SERVICE_URL: http://auth-service:8005
+      NOTIFICATION_SERVICE_URL: http://notification-service:8011
+      DEBUG: "false"
+    healthcheck:
+      interval: 3s
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # NEW: Integration test runner
+  # ---------------------------------------------------------------------------
+  integration-runner:
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-crm-ci}-integration-runner
+    working_dir: /tests
+    environment:
+      INTEGRATION_BASE_URL: http://nginx-gateway
+    volumes:
+      - integration-results:/tests/results
+    depends_on:
+      nginx-gateway:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - crm_network
+
+volumes:
+  integration-results:
