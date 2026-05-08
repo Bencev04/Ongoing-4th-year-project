@@ -9,9 +9,9 @@ vpc_cidr     = "10.10.0.0/16"
 kubernetes_version = "1.30"
 
 node_instance_type = "t3.medium"
-node_desired_size  = 2
+node_desired_size  = 4 # App + observability + in-cluster k6 need pod-density headroom
 node_min_size      = 1
-node_max_size      = 3
+node_max_size      = 4 # Allows the k6 test pod to schedule while staging is fully loaded
 
 rds_instance_class    = "db.t3.micro"
 rds_allocated_storage = 20

@@ -639,9 +639,9 @@ apply-production:
 #   1. CD needs to deploy to staging → triggers with TARGET_ENV=staging
 #   2. CD promotes to prod → triggers with TARGET_ENV=production
 #
-# Scenario 1: Cluster running with nodes  → do nothing
-# Scenario 2: Cluster exists, 0 nodes     → scale up
-# Scenario 3: Cluster doesn't exist       → full terraform apply
+# Scenario 1: Cluster running at/above target nodes → do nothing
+# Scenario 2: Cluster exists below target nodes     → scale up
+# Scenario 3: Cluster doesn't exist                 → full terraform apply
 
 ensure-cluster-up:
   stage: ensure
@@ -660,8 +660,11 @@ ensure-cluster-up:
       else
         CLUSTER=$STAGING_CLUSTER_NAME
         NODE_GROUP=$STAGING_NODE_GROUP
-        DESIRED_COUNT=2
-        MAX_COUNT=3
+        # Staging runs the full app plus observability and in-cluster k6 jobs.
+        # Three t3.medium nodes hit Kubernetes pod-density limits during tests,
+        # so keep four nodes available whenever staging is up.
+        DESIRED_COUNT=4
+        MAX_COUNT=4
       fi
 
       echo "Checking if $TARGET_ENV EKS cluster ($CLUSTER) exists..."
@@ -679,8 +682,12 @@ ensure-cluster-up:
         --query 'nodegroup.scalingConfig.desiredSize' \
         --output text 2>/dev/null || echo "0")
 
-      if [ "$DESIRED" = "0" ] || [ "$DESIRED" = "None" ]; then
-        echo "Nodes scaled to 0 — scaling $TARGET_ENV up to $DESIRED_COUNT..."
+      if [ -z "$DESIRED" ] || [ "$DESIRED" = "None" ]; then
+        DESIRED=0
+      fi
+
+      if [ "$DESIRED" -lt "$DESIRED_COUNT" ]; then
+        echo "$TARGET_ENV node group has $DESIRED node(s), below required $DESIRED_COUNT — scaling up..."
         aws eks update-nodegroup-config \
           --cluster-name $CLUSTER \
           --nodegroup-name $NODE_GROUP \
@@ -694,7 +701,7 @@ ensure-cluster-up:
           --region $AWS_DEFAULT_REGION
         echo "$TARGET_ENV nodes are up."
       else
-        echo "$TARGET_ENV cluster already running with $DESIRED node(s). Nothing to do."
+        echo "$TARGET_ENV cluster already running with $DESIRED node(s), required $DESIRED_COUNT. Nothing to do."
       fi
   rules:
     - if: $DESTROY_ENV
@@ -832,7 +839,7 @@ scale-down-staging:
     TARGET_CLUSTER: ${STAGING_CLUSTER_NAME}
     TARGET_NODE_GROUP: ${STAGING_NODE_GROUP}
     TARGET_ENV: staging
-    MAX_SIZE: "3"
+    MAX_SIZE: "4"
     ENV_LABEL: Staging
 
 scale-up-staging:
@@ -841,8 +848,8 @@ scale-up-staging:
   variables:
     TARGET_CLUSTER: ${STAGING_CLUSTER_NAME}
     TARGET_NODE_GROUP: ${STAGING_NODE_GROUP}
-    DESIRED: "2"
-    MAX_SIZE: "3"
+    DESIRED: "4"
+    MAX_SIZE: "4"
     ENV_LABEL: Staging
 
 scale-down-production:
